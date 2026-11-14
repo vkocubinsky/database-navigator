@@ -152,7 +152,7 @@ class Navigator(ttk.Frame):
         self.reset_metadata_button = ttk.Button(toolbar, text="Reset cache", command=self.reset_metadata)
         self.reset_metadata_button.pack(side="left", padx=8)
         self.relationships_button = ttk.Button(
-            toolbar, text='Relationships…', command=self.manage_relationships,
+            toolbar, text='Relationships', command=self.manage_relationships,
             state='normal' if self.model else 'disabled')
         self.relationships_button.pack(side='left', padx=(0, 8))
         self.diagram_button = ttk.Button(toolbar, text='Diagram', state='disabled', command=self.show_diagram)

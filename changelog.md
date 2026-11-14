@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0
+
+- Rename the Relationships button for consistency with other toolbar buttons.
+- Refresh the Sakila screenshots in the README.
+
 ## 0.3.0
 
 - License Database Navigator under GPL-3.0-or-later.

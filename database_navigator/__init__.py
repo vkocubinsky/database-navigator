@@ -16,4 +16,4 @@
 
 """Read-only SQLite/PostgreSQL browsing with a Tkinter interface."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

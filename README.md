@@ -78,7 +78,7 @@ The model is a name you choose for a database structure. It enables saved
 preferences, startup SQL, and custom relationships. If omitted, `--model` uses
 `default`. Connections using the same model and application database share these
 settings; choose distinct model names for unrelated databases. Custom relationships are defined through
-**Relationships…** with a model; importing relationship files is not supported.
+**Relationships** with a model; importing relationship files is not supported.
 
 ### SQLite
 
@@ -158,7 +158,7 @@ and **Any** filter relationship direction. **Open table** and **Open row** move
 related data into the master view; **Back** and **Forward** navigate history.
 
 - Composite foreign keys and relationships across PostgreSQL schemas are supported.
-- **Relationships…** manages additional local relationship declarations when
+- **Relationships** manages additional local relationship declarations when
   using a model, without changing database constraints.
 - **Diagram** shows the current table's direct relationships.
 - **Columns** and **Order** customize related-table queries for a model.
