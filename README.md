@@ -140,7 +140,6 @@ the database file must already exist.
 
 ```sh
 ./launch.sh --help
-./launch.sh --version
 ./launch.sh --model example --application-database /absolute/path/preferences.sqlite \
   'sqlite:////absolute/path/example.sqlite'
 ```
@@ -150,9 +149,6 @@ directory, even when invoked from elsewhere. Relative paths are resolved there.
 By default, model preferences are stored in `database-navigator.sqlite` in that
 directory. This file must be separate from the database being browsed. Keep it
 private: it can contain saved SQL and database relationship details.
-
-The window title shows the application version. Use `launch.bat --version` on
-Windows to print it without opening a window or connecting to a database.
 
 ## Browse data
 
@@ -176,4 +172,27 @@ Generated PostgreSQL SQL requires unquoted lowercase identifiers. **Open row**
 requires a declared primary key; views can have custom relationships but cannot
 use Open row. SQLite UI browsing uses the `main` schema.
 
-See [changelog.md](changelog.md) for user-visible changes.
+## Version
+
+To check your installed version:
+
+```sh
+./launch.sh --version
+```
+
+On Windows:
+
+```bat
+launch.bat --version
+```
+
+These commands print the version without opening a window or connecting to a
+database. The window title also shows the version.
+
+See [changelog.md](changelog.md) for release history.
+
+## License
+
+Database Navigator is licensed under the GNU General Public License,
+version 3 or (at your option) any later version (`GPL-3.0-or-later`).
+See [LICENSE](LICENSE) for the full terms.
