@@ -16,16 +16,24 @@
 
 """SQLite dialect, read-only backend, and metadata discovery."""
 
-from dataclasses import replace
 from pathlib import Path
 import math
 import re
 import sqlite3
 import time
 
-from .models import ForeignKey, Relationship, TableNotFoundError, validate_limit
-from .queries import (derived_reference, navigation_query, primary_key_values,
-                      relationship_values, selected_sql)
+from .contracts import TableNotFoundError
+from .metadata_models import Column, Relationship, Table, TableDetails, TableRef, TableSummary
+from .navigation import (derived_reference, primary_key_values, validate_limit)
+
+
+__all__ = [
+    "SQLiteBackend",
+    "SQLiteDialect",
+    "SQLITE",
+    "sqlite_primary_key",
+    "sqlite_foreign_keys",
+]
 
 
 _SQLITE_IDENTIFIER_FOLD = str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
@@ -64,12 +72,22 @@ class SQLiteDialect:
     def split_reference(self, reference):
         return self.default_schema, reference
 
-    def relationship_schema(self, schema):
-        # The single supported schema is implicit in existing navigation labels.
-        return None
-
     def validate_row_key(self, key, columns, row):
         return primary_key_values(key, columns, row, self.identifier_key)
+
+    placeholder = '?'
+
+    def sql_table(self, ref):
+        self.validate_schema(ref.schema)
+        self.validate_identifier(ref.name)
+        return sqlite_sql_identifier(ref.name)
+
+    def sql_column(self, ref, name):
+        self.validate_identifier(name)
+        return f'{self.sql_table(ref)}.{sqlite_sql_identifier(name)}'
+
+    def sql_literal(self, value):
+        return sqlite_literal(value)
 
 
 SQLITE = SQLiteDialect()
@@ -121,12 +139,6 @@ def sqlite_literal(value):
     raise ValueError(f"Cannot display a SQLite key of type {type(value).__name__}.")
 
 
-def sqlite_relationship_identifiers(relationship):
-    """Qualify columns so SQLite cannot interpret missing names as string literals."""
-    table = sqlite_sql_identifier(relationship.table)
-    return table, tuple(f'{table}.{sqlite_sql_identifier(name)}' for name in relationship.columns)
-
-
 def derived_table(query):
     schema, table = derived_reference(query)
     if schema is not None:
@@ -157,9 +169,9 @@ def sqlite_primary_key(connection: sqlite3.Connection, table: str,
 
 def sqlite_foreign_keys(
     connection: sqlite3.Connection, table: str, schema: str = "main", *,
-    target_table: str | None = None,
-) -> list[ForeignKey]:
-    """Read SQLite keys, optionally filtering targets before resolving implicit keys."""
+    parent_table: str | None = None,
+) -> list[Relationship]:
+    """Read SQLite keys, optionally filtering parent tables before resolving implicit keys."""
     cursor = connection.cursor()
     cursor.row_factory = None
     try:
@@ -180,22 +192,26 @@ def sqlite_foreign_keys(
         result = []
         for key_id in sorted(grouped):
             parts = sorted(grouped[key_id], key=lambda row: row[1])
-            target = parts[0][2]
-            if (target_table is not None
-                    and sqlite_identifier_key(target) != sqlite_identifier_key(target_table)):
+            parent = parts[0][2]
+            if (parent_table is not None
+                    and sqlite_identifier_key(parent) != sqlite_identifier_key(parent_table)):
                 continue
-            target_columns = tuple(row[4] for row in parts)
-            if any(column is None for column in target_columns):
+            parent_key = tuple(row[4] for row in parts)
+            if any(column is None for column in parent_key):
                 info = cursor.execute(
-                    f"PRAGMA {namespace}.table_info({sqlite_quote_identifier(target)})"
+                    f"PRAGMA {namespace}.table_info({sqlite_quote_identifier(parent)})"
                 ).fetchall()
                 primary_key = sorted((row for row in info if row[5]), key=lambda row: row[5])
                 if len(primary_key) != len(parts):
-                    raise ValueError(f"Cannot resolve referenced primary key: {schema}.{target}")
-                target_columns = tuple(row[1] for row in primary_key)
-            result.append(ForeignKey(
-                None, schema, table, tuple(row[3] for row in parts),
-                schema, target, target_columns,
+                    raise ValueError(f"Cannot resolve referenced primary key: {schema}.{parent}")
+                parent_key = tuple(row[1] for row in primary_key)
+            result.append(Relationship(
+                parent_table=TableRef(schema, parent),
+                child_table=TableRef(schema, table),
+                parent_key=parent_key,
+                child_key=tuple(row[3] for row in parts),
+                origin='database',
+                relationship_id=key_id,
             ))
         return result
     finally:
@@ -246,26 +262,69 @@ class SQLiteBackend:
             self._connection.close()
             self._connection = None
 
-    def resolve_table(self, table):
+    def list_tables(self) -> tuple[TableSummary, ...]:
+        rows = self.connection.execute('''
+            SELECT schema, name, CASE type WHEN 'virtual' THEN 'table' ELSE type END
+            FROM pragma_table_list
+            WHERE type IN ('table', 'view', 'virtual')
+              AND substr(name, 1, 7) <> 'sqlite_'
+            ORDER BY schema, name
+        ''').fetchall()
+        return tuple(TableSummary(TableRef(schema, name), kind) for schema, name, kind in rows)
+
+    def resolve(self, name: str) -> TableRef:
         row = self.connection.execute(
             "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND name = ? COLLATE NOCASE",
-            (table,)).fetchone()
+            (name,)).fetchone()
         if row is None:
-            raise TableNotFoundError(f"Table not found: {table}")
-        return 'main', row[0]
+            raise TableNotFoundError(f"Table not found: {name}")
+        return TableRef('main', row[0])
 
-    def relationships(self, table):
-        outgoing = sqlite_foreign_keys(self.connection, table)
-        result = [Relationship(key.target_table, key.target_columns, key.source_columns,
-                               "parent") for key in outgoing]
-        names = self.connection.execute(
-            "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name"
+    def table(self, ref):
+        connection = self.connection
+        namespace = sqlite_quote_identifier(ref.schema)
+        cursor = connection.cursor()
+        cursor.row_factory = None
+        try:
+            found = cursor.execute(
+                f'SELECT name, type FROM {namespace}.sqlite_schema '
+                "WHERE type IN ('table', 'view') AND name = ? COLLATE NOCASE", (ref.name,)
+            ).fetchone()
+            if found is None:
+                raise TableNotFoundError(f'Table not found: {ref.schema}.{ref.name}')
+            name, kind = found
+            rows = cursor.execute(
+                f'PRAGMA {namespace}.table_xinfo({sqlite_quote_identifier(name)})'
+            ).fetchall()
+            primary = tuple(row[1] for row in sorted(rows, key=lambda row: row[5]) if row[5])
+            # table_xinfo omits the implicit NOT NULL of an INTEGER rowid alias.
+            # INTEGER PRIMARY KEY DESC has a separate index and is not an alias.
+            integer_key = len(primary) == 1 and any(
+                row[5] and row[2].upper() == 'INTEGER' for row in rows)
+            rowid_alias = integer_key and not any(row[3] == 'pk' for row in cursor.execute(
+                f'PRAGMA {namespace}.index_list({sqlite_quote_identifier(name)})').fetchall())
+            columns = tuple(Column(row[1], row[2], not (bool(row[3]) or (rowid_alias and bool(row[5]))))
+                            for row in rows)
+            return Table(TableRef(ref.schema, name), columns, primary, kind)
+        finally:
+            cursor.close()
+
+    def details(self, ref: TableRef) -> TableDetails:
+        table = self.table(ref)
+        return TableDetails(table, parent_relationships=self._parent_relationships(table.ref),
+                            child_relationships=self._child_relationships(table.ref))
+
+    def _parent_relationships(self, ref):
+        return tuple(sqlite_foreign_keys(self.connection, ref.name, ref.schema))
+
+    def _child_relationships(self, ref):
+        connection = self.connection
+        namespace = sqlite_quote_identifier(ref.schema)
+        names = connection.execute(
+            f"SELECT name FROM {namespace}.sqlite_schema WHERE type = 'table' ORDER BY name"
         ).fetchall()
-        for (name,) in names:
-            for key in sqlite_foreign_keys(self.connection, name, target_table=table):
-                result.append(Relationship(key.source_table, key.source_columns,
-                                           key.target_columns, "child"))
-        return result
+        return tuple(key for (name,) in names
+                     for key in sqlite_foreign_keys(connection, name, ref.schema, parent_table=ref.name))
 
     def query(self, sql, limit, parameters=()):
         validate_limit(limit)
@@ -293,31 +352,6 @@ class SQLiteBackend:
             self.connection.set_authorizer(None)
             self.connection.set_progress_handler(None, 0)
 
-    def table_columns(self, relationship):
-        table = sqlite_sql_identifier(relationship.table)
-        return self.query(f'SELECT * FROM {table} LIMIT 0', 1)[0]
-
-    def primary_key(self, table, schema=None):
-        return sqlite_primary_key(self.connection, table, schema or 'main')
-
-    def row_navigation_query(self, relationship, columns, row, limit, selected_columns=None, order_by=()):
-        key = self.primary_key(relationship.table, relationship.schema)
-        self.dialect.validate_row_key(key, columns, row)
-        target = replace(relationship, columns=key, selected_columns=key)
-        return self.navigation_query(target, columns, row, limit, selected_columns, order_by)
-
     def execute_related_query(self, query, limit):
         """Execute the same bound query whose literal form is shown in the UI."""
         return self.query(query.statement, limit, query.parameters)
-
-    def _related_parts(self, relationship, columns, row, selected_columns, order_by):
-        values = relationship_values(relationship, columns, row, self.dialect)
-        table, names = sqlite_relationship_identifiers(relationship)
-        projection, order = selected_sql(
-            selected_columns, order_by, identifier=lambda name: f'{table}.{sqlite_sql_identifier(name)}')
-        return table, names, values, projection, order
-
-    def navigation_query(self, relationship, columns, row, limit, selected_columns=None, order_by=()):
-        table, names, values, projection, order = self._related_parts(
-            relationship, columns, row, selected_columns, order_by)
-        return navigation_query(table, names, values, limit, '?', sqlite_literal, projection, order)

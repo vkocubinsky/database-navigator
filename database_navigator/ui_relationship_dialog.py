@@ -19,19 +19,24 @@
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from .metadata_models import Relationship, TableRef
+
+
+__all__ = ["RelationshipDialog"]
+
 
 def notation(key):
-    return (f"{key.source_schema}.{key.source_table}({', '.join(key.source_columns)}) → "
-            f"{key.target_schema}.{key.target_table}({', '.join(key.target_columns)})")
+    return (f"{key.child_table.schema}.{key.child_table.name}({', '.join(key.child_key)}) → "
+            f"{key.parent_table.schema}.{key.parent_table.name}({', '.join(key.parent_key)})")
 
 
 class RelationshipDialog(tk.Toplevel):
-    def __init__(self, parent, model, source, service, request, changed):
+    def __init__(self, parent, model, child, navigation, request, changed):
         super().__init__(parent)
         self.request = request
         self.changed = changed
-        self.source = source
-        self.service = service
+        self.child = child
+        self.navigation = navigation
         self.records = {}
         self.identifier = None
         self.busy = False
@@ -68,7 +73,7 @@ class RelationshipDialog(tk.Toplevel):
         endpoints = ttk.Frame(editor)
         endpoints.pack(fill='x', pady=6)
         self.endpoints = []
-        for index, label in enumerate(('Source (foreign-key columns)', 'Referenced table')):
+        for index, label in enumerate(('Child table', 'Parent table')):
             frame = ttk.Frame(endpoints)
             frame.grid(row=0, column=index, sticky='ew', padx=(0, 12) if index == 0 else 0)
             endpoints.columnconfigure(index, weight=1)
@@ -87,10 +92,10 @@ class RelationshipDialog(tk.Toplevel):
         load_bar = ttk.Frame(editor)
         load_bar.pack(fill='x')
         self.button(load_bar, 'Load columns', self.load_columns)
-        ttk.Label(load_bar, text=('Blank schema uses the connection search path.' if service.supports_schemas else
+        ttk.Label(load_bar, text=('Blank schema uses the connection search path.' if navigation.supports_schemas else
                                  'Use schema main. Enter table names without SQL quotes.')
                   ).pack(side='left', padx=6)
-        self.pairs = self.tree(editor, ('source', 'target'), ('Source column', 'Referenced column'), 4)
+        self.pairs = self.tree(editor, ('child', 'parent'), ('Child column', 'Parent column'), 4)
         selectors = ttk.Frame(editor)
         selectors.pack(fill='x', pady=6)
         self.column_vars = [tk.StringVar(), tk.StringVar()]
@@ -112,7 +117,7 @@ class RelationshipDialog(tk.Toplevel):
         footer = ttk.Frame(body)
         footer.pack(fill='x')
         self.save_button = self.button(footer, 'Save relationship', self.save)
-        self.close_button = self.button(footer, 'Close', self.cancel)
+        self.button(footer, 'Close', self.cancel)
         self.new()
         self.reload()
         self.grab_set()
@@ -170,15 +175,15 @@ class RelationshipDialog(tk.Toplevel):
         if self.busy:
             return
         def ready(records):
-            self.records = dict(records)
+            self.records = {record.id: record for record in records}
             self.relationships.delete(*self.relationships.get_children())
-            for identifier, key in records:
-                self.relationships.insert('', 'end', iid=str(identifier), values=(notation(key),))
+            for record in records:
+                self.relationships.insert('', 'end', iid=str(record.id), values=(notation(record.relationship),))
             if selected in self.records:
                 self.relationships.selection_set(str(selected))
                 self.relationships.see(str(selected))
             self.update_controls()
-        self.run(self.service.custom_relationships, (), ready, 'Loading custom relationships…')
+        self.run(self.navigation.custom_relationships, (), ready, 'Loading custom relationships…')
 
     def invalidate_columns(self, *args):
         self.loaded = False
@@ -191,9 +196,9 @@ class RelationshipDialog(tk.Toplevel):
             return
         self.identifier = None
         self.editor_title.set('New relationship')
-        self.endpoints[0][0].set(self.source[0] or '')
-        self.endpoints[0][1].set(self.source[1])
-        self.endpoints[1][0].set(self.source[0] or ('' if self.service.supports_schemas else 'main'))
+        self.endpoints[0][0].set(self.child[0] or '')
+        self.endpoints[0][1].set(self.child[1])
+        self.endpoints[1][0].set(self.child[0] or ('' if self.navigation.supports_schemas else 'main'))
         self.endpoints[1][1].set('')
         self.pairs.delete(*self.pairs.get_children())
         for variable in self.column_vars:
@@ -206,14 +211,14 @@ class RelationshipDialog(tk.Toplevel):
         if self.busy or not selected:
             return
         self.identifier = int(selected[0])
-        key = self.records[self.identifier]
+        key = self.records[self.identifier].relationship
         self.editor_title.set('Editing custom relationship')
-        for variables, values in zip(self.endpoints, ((key.source_schema, key.source_table),
-                                                      (key.target_schema, key.target_table))):
+        for variables, values in zip(self.endpoints, ((key.child_table.schema, key.child_table.name),
+                                                      (key.parent_table.schema, key.parent_table.name))):
             for variable, value in zip(variables, values):
                 variable.set(value)
         self.pairs.delete(*self.pairs.get_children())
-        for pair in zip(key.source_columns, key.target_columns):
+        for pair in zip(key.child_key, key.parent_key, strict=True):
             self.pairs.insert('', 'end', values=pair)
         self.load_columns()
 
@@ -225,20 +230,20 @@ class RelationshipDialog(tk.Toplevel):
             self.error.set('Enter both table names first.')
             return
         self.loaded = False
-        def source_ready(source):
-            def target_ready(target):
-                for variables, endpoint in zip(self.endpoints, (source, target)):
+        def child_ready(child):
+            def parent_ready(parent):
+                for variables, endpoint in zip(self.endpoints, (child, parent)):
                     for variable, value in zip(variables, endpoint[:2]):
                         variable.set(value)
-                self.columns = (source[2], target[2])
+                self.columns = (child[2], parent[2])
                 for combo, variable, columns in zip(self.combos, self.column_vars, self.columns):
                     combo.configure(values=columns)
                     variable.set(columns[0] if columns else '')
                 self.loaded = True
                 self.update_controls()
                 self.error.set('Choose column pairs in order, then save.')
-            self.run(self.service.relationship_columns, endpoints[1], target_ready, 'Loading referenced columns…')
-        self.run(self.service.relationship_columns, endpoints[0], source_ready, 'Loading source columns…')
+            self.run(self.navigation.relationship_columns, endpoints[1], parent_ready, 'Loading parent columns…')
+        self.run(self.navigation.relationship_columns, endpoints[0], child_ready, 'Loading child columns…')
 
     def select_pair(self, event=None):
         if self.busy:
@@ -259,7 +264,7 @@ class RelationshipDialog(tk.Toplevel):
             if child != item:
                 existing = self.pairs.item(child, 'values')
                 if any(a == b for a, b in zip(pair, existing)):
-                    self.error.set('Use each source and referenced column only once.')
+                    self.error.set('Use each child and parent column only once.')
                     return
         if item is None:
             item = self.pairs.insert('', 'end', values=pair)
@@ -293,16 +298,25 @@ class RelationshipDialog(tk.Toplevel):
         if not pairs:
             self.error.set('Add at least one column pair.')
             return
-        endpoints = {}
-        for index, side in enumerate(('source', 'target')):
-            schema, table = (variable.get() for variable in self.endpoints[index])
-            endpoints[side] = {'schema': schema, 'table': table, 'columns': [pair[index] for pair in pairs]}
-        def saved(identifier):
-            self.identifier = identifier
+        try:
+            child, parent = (TableRef(*(variable.get() for variable in endpoint))
+                             for endpoint in self.endpoints)
+            key = Relationship(
+                parent_table=parent,
+                child_table=child,
+                parent_key=tuple(pair[1] for pair in pairs),
+                child_key=tuple(pair[0] for pair in pairs),
+                origin='user_defined',
+            )
+        except ValueError as exc:
+            self.error.set(str(exc))
+            return
+        def saved(record):
+            self.identifier = record.id
             self.editor_title.set('Editing custom relationship')
             self.changed()
-            self.reload(identifier)
-        self.run(self.service.save_custom_relationship, (self.identifier, {'relationships': [endpoints]}),
+            self.reload(record.id)
+        self.run(self.navigation.save_custom_relationship, (self.identifier, key),
                  saved, 'Validating and saving relationship…')
 
     def delete(self):
@@ -312,14 +326,14 @@ class RelationshipDialog(tk.Toplevel):
         identifier = int(selected[0])
         if not messagebox.askyesno('Delete custom relationship',
                                   f'Delete this declaration from the current model?\n\n'
-                                  f'{notation(self.records[identifier])}', parent=self):
+                                  f'{notation(self.records[identifier].relationship)}', parent=self):
             return
         def deleted(_):
             if self.identifier == identifier:
                 self.new()
             self.changed()
             self.reload()
-        self.run(self.service.delete_custom_relationship, (identifier,), deleted, 'Deleting custom relationship…')
+        self.run(self.navigation.delete_custom_relationship, (identifier,), deleted, 'Deleting custom relationship…')
 
     def cancel(self):
         if not self.busy:

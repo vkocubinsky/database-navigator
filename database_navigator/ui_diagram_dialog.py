@@ -20,6 +20,9 @@ import tkinter as tk
 from tkinter import ttk
 
 
+__all__ = ["DiagramDialog"]
+
+
 class DiagramDialog(tk.Toplevel):
     def __init__(self, parent, select, table_key):
         super().__init__(parent)
@@ -37,7 +40,7 @@ class DiagramDialog(tk.Toplevel):
         self.bind('<Escape>', lambda event: self.destroy())
         body = ttk.Frame(self, padding=12)
         body.pack(fill='both', expand=True)
-        ttk.Label(body, text='Direct parents and children only · Arrows point to the referenced table',
+        ttk.Label(body, text='Direct parents and children only · Arrows point to the parent table',
                   wraplength=560).pack(anchor='w')
         ttk.Label(body, text='Click an arrow or column mapping to show related rows.',
                   wraplength=560).pack(anchor='w', pady=(4, 0))
@@ -127,9 +130,8 @@ class DiagramDialog(tk.Toplevel):
 
     def _mapping(self, index):
         link = self.links[index]
-        source, target = ((link.selected_columns, link.columns) if link.direction == 'parent'
-                          else (link.columns, link.selected_columns))
-        return '\n'.join(f'{left} → {right}' for left, right in zip(source, target))
+        return '\n'.join(f'{child} → {parent}' for child, parent in
+                         zip(link.relationship.child_key, link.relationship.parent_key, strict=True))
 
     def _bind_link(self, index):
         tag = f'link:{index}'

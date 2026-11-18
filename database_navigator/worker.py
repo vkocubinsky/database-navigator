@@ -16,19 +16,24 @@
 
 """Bounded database thread pool, with one private connection per worker."""
 
+from collections import deque
 from concurrent.futures import Future
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
 
-from .metadata import MetadataCache
+from .metadata_cache import MetadataCache
+from .metadata_models import TableRef
+
+
+__all__ = ["DatabasePool", "PendingTasks"]
 
 
 class DatabasePool:
-    def __init__(self, browser_factory, max_workers=4, *, metadata=None):
+    def __init__(self, session_factory, max_workers=4, *, metadata=None):
         if not isinstance(max_workers, int) or isinstance(max_workers, bool) or max_workers < 1:
             raise ValueError("Worker count must be a positive integer.")
         self.metadata = metadata if metadata is not None else MetadataCache()
-        self.browser_factory = browser_factory
+        self.session_factory = session_factory
         self.jobs = Queue()
         self.stopping = Event()
         self._lock = Lock()
@@ -65,7 +70,7 @@ class DatabasePool:
             future.cancel()
 
     def _run(self):
-        browser = None
+        session = None
         try:
             while True:
                 job = self.jobs.get()
@@ -80,17 +85,95 @@ class DatabasePool:
                 if not running:
                     continue
                 try:
-                    if browser is None:
-                        browser = self.browser_factory()
-                    if method == "relationships":
-                        result = self.metadata.relationships(browser, *args, generation)
+                    if session is None:
+                        session = self.session_factory()
+                    if method == "navigation_links":
+                        result = self.metadata.navigation_links(session, *args, generation)
+                    elif method in ('list_tables', 'table', 'details'):
+                        result = getattr(self.metadata, method)(session, *args, generation)
+                    elif method == 'primary_key':
+                        table, schema = args
+                        ref = (TableRef(schema, table) if schema else
+                               self.metadata.resolve_table(session, table, generation))
+                        result = self.metadata.table(session, ref, generation).primary_key
                     elif method == 'relationship_diagram':
-                        result = self.metadata.relationship_diagram(browser, *args, generation)
+                        result = self.metadata.relationship_diagram(session, *args, generation)
                     else:
-                        result = getattr(browser, method)(*args)
+                        result = getattr(session, method)(*args)
                     future.set_result(result)
                 except Exception as exc:
                     future.set_exception(exc)
         finally:
-            if browser is not None:
-                browser.close()
+            if session is not None:
+                session.close()
+
+
+class PendingTasks:
+    """Poll futures and deliver callbacks on the owning thread, with ordered saves."""
+
+    def __init__(self):
+        self.closed = False
+        self.pending = []
+        self._ordered_jobs = deque()
+        self._ordered_job = None
+
+    @property
+    def busy(self):
+        return (bool(self._ordered_jobs) or self._ordered_job is not None
+                or any(current() for _, _, _, current in self.pending))
+
+    def submit(self, operation, args, completed, failed, current=lambda: True):
+        future = operation(*args)
+        self.pending.append((future, completed, failed, current))
+        return future
+
+    def queue_ordered(self, operation, args, completed, failed, current=lambda: True):
+        # Saves outlive navigation. New defaults reads must follow earlier saves.
+        self._ordered_jobs.append((operation, args, completed, failed, current))
+
+    @staticmethod
+    def _deliver(future, completed, failed):
+        try:
+            result = future.result()
+        except Exception as exc:
+            failed(exc)
+        else:
+            completed(result)
+
+    def _poll_ordered(self):
+        if self._ordered_job is not None:
+            future, completed, failed, current = self._ordered_job
+            if not future.done():
+                return
+            self._ordered_job = None
+            if current():
+                self._deliver(future, completed, failed)
+        while not self.closed and self._ordered_jobs and self._ordered_job is None:
+            operation, args, completed, failed, current = self._ordered_jobs.popleft()
+            if current():
+                self._ordered_job = (operation(*args), completed, failed, current)
+
+    def poll(self):
+        if self.closed:
+            return
+        self._poll_ordered()
+        pending, self.pending = self.pending, []
+        for future, completed, failed, current in pending:
+            if self.closed or not current():
+                future.cancel()
+            elif not future.done():
+                self.pending.append((future, completed, failed, current))
+            else:
+                self._deliver(future, completed, failed)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        for future, *_ in self.pending:
+            future.cancel()
+        self.pending.clear()
+        self._ordered_jobs.clear()
+        if self._ordered_job is not None:
+            self._ordered_job[0].cancel()
+            self._ordered_job = None

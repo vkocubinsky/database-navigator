@@ -14,23 +14,22 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Column and ordering editors; all persistence is delegated to the caller."""
+"""Sort-key editor with priority and direction; persistence is delegated to the caller."""
 
 import tkinter as tk
 from tkinter import ttk
 
-from .models import parse_columns
+
+__all__ = ["OrderDialog"]
 
 
-class PropertyDialog(tk.Toplevel):
-    def __init__(self, parent, link, property_name, columns, saved, apply):
+class OrderDialog(tk.Toplevel):
+    def __init__(self, parent, link, columns, selected, apply, *, error=''):
         super().__init__(parent)
-        self.property_name = property_name
         self.apply_callback = apply
         self.columns = columns
         self.saving = False
-        ordering = property_name == 'order_by'
-        self.title(f'{"Order" if ordering else "Columns"} — {link.display_table}')
+        self.title(f'Order — {link.display_table}')
         self.transient(parent.winfo_toplevel())
         self.geometry('560x480')
         self.minsize(460, 350)
@@ -41,26 +40,14 @@ class PropertyDialog(tk.Toplevel):
         ttk.Label(body, text=link.display_table, font=('TkDefaultFont', 12, 'bold')).pack(anchor='w')
         mode_bar = ttk.Frame(body)
         mode_bar.pack(fill='x', pady=10)
-        self.mode = tk.StringVar(value='choose' if property_name in saved else 'default')
-        for label, value in ((('No order' if ordering else 'All'), 'default'), ('Choose', 'choose')):
+        self.mode = tk.StringVar(value='choose' if selected is not None else 'default')
+        for label, value in (('No order', 'default'), ('Choose', 'choose')):
             ttk.Radiobutton(mode_bar, text=label, value=value, variable=self.mode,
                             command=self.update_mode).pack(side='left', padx=(0, 12))
-        self.error = tk.StringVar()
-        try:
-            selected = parse_columns(saved.get(property_name), ordering=ordering)
-        except ValueError as exc:
-            selected = ()
-            self.error.set(str(exc))
+        self.error = tk.StringVar(value=error)
         self.controls = ttk.Frame(body)
         self.controls.pack(fill='both', expand=True)
-        if ordering:
-            self.build_order(selected)
-        else:
-            if property_name not in saved:
-                selected = self.columns
-            self.build_columns(selected)
-            ttk.Label(body, text='Include key columns if you want to navigate further from this table.',
-                      wraplength=510).pack(anchor='w', pady=(8, 0))
+        self.build_order(selected or ())
         ttk.Label(body, textvariable=self.error, wraplength=510).pack(fill='x', pady=8)
         buttons = ttk.Frame(body)
         buttons.pack(fill='x')
@@ -70,55 +57,6 @@ class PropertyDialog(tk.Toplevel):
         self.cancel_button.pack(side='right', padx=8)
         self.update_mode()
         self.grab_set()
-
-    def build_columns(self, selected):
-        canvas = self.column_canvas = tk.Canvas(self.controls, highlightthickness=0, yscrollincrement=1)
-        window_system = self.tk.call('tk', 'windowingsystem')
-        tk9 = self.tk.call('package', 'vcompare', self.tk.call('package', 'provide', 'Tk'), '9.0') >= 0
-        self._wheel_scale = 24 / (1 if window_system == 'aqua' and not tk9 else 120)
-        self._wheel_remainder = 0.0
-        scroll = ttk.Scrollbar(self.controls, orient='vertical', command=canvas.yview)
-        canvas.configure(yscrollcommand=scroll.set)
-        scroll.pack(side='right', fill='y')
-        canvas.pack(fill='both', expand=True)
-        self.checks = ttk.Frame(canvas)
-        window = canvas.create_window((0, 0), window=self.checks, anchor='nw')
-        self.checks.bind('<Configure>', lambda event: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>', lambda event: canvas.itemconfigure(window, width=event.width))
-        self.column_vars = {}
-        for name in self.columns:
-            variable = tk.BooleanVar(value=name in selected)
-            self.column_vars[name] = variable
-            ttk.Checkbutton(self.checks, text=name, variable=variable).pack(anchor='w', pady=2)
-        # Bind only this list and its children, never all application windows.
-        for widget in (canvas, self.checks, *self.checks.winfo_children()):
-            widget.bind('<MouseWheel>', self.scroll_columns_wheel)
-            if tk9:
-                widget.bind('<TouchpadScroll>', self.scroll_columns_touchpad)
-            if window_system == 'x11':
-                widget.bind('<Button-4>', lambda event: self.scroll_columns(-24))
-                widget.bind('<Button-5>', lambda event: self.scroll_columns(24))
-        missing = set(selected) - set(self.columns)
-        if missing:
-            self.error.set('Unavailable saved columns: ' + ', '.join(sorted(missing)))
-
-    def scroll_columns(self, pixels):
-        self.column_canvas.yview_scroll(pixels, 'units')
-        return 'break'
-
-    def scroll_columns_wheel(self, event):
-        if event.state & 1:  # Shift-wheel is horizontal, not vertical scrolling.
-            return 'break'
-        self._wheel_remainder -= event.delta * self._wheel_scale
-        pixels = int(self._wheel_remainder)
-        self._wheel_remainder -= pixels
-        return self.scroll_columns(pixels)
-
-    def scroll_columns_touchpad(self, event):
-        # Tk 9 packs both axes into %D. Its decoder preserves the signed deltas
-        # supplied by macOS, including natural scrolling and momentum.
-        _, vertical = self.tk.call('tk::PreciseScrollDeltas', event.delta)
-        return self.scroll_columns(-int(vertical))
 
     def build_order(self, selected):
         editor = ttk.Frame(self.controls)
@@ -205,7 +143,7 @@ class PropertyDialog(tk.Toplevel):
         enabled = self.mode.get() == 'choose' and not self.saving
         def visit(widget):
             for child in widget.winfo_children():
-                if isinstance(child, (ttk.Button, ttk.Checkbutton, ttk.Combobox)):
+                if isinstance(child, (ttk.Button, ttk.Combobox)):
                     child.configure(state=('readonly' if isinstance(child, ttk.Combobox) else 'normal')
                                     if enabled else 'disabled')
                 visit(child)
@@ -216,10 +154,8 @@ class PropertyDialog(tk.Toplevel):
             return
         choices = None
         if self.mode.get() == 'choose':
-            choices = (tuple(tuple(self.order_list.item(item, 'values'))
-                             for item in self.order_list.get_children())
-                       if self.property_name == 'order_by' else
-                       tuple(name for name, variable in self.column_vars.items() if variable.get()))
+            choices = tuple(tuple(self.order_list.item(item, 'values'))
+                            for item in self.order_list.get_children())
             if not choices:
                 self.error.set('Choose at least one column.')
                 return
@@ -240,3 +176,7 @@ class PropertyDialog(tk.Toplevel):
     def cancel(self):
         if not self.saving:
             self.destroy()
+
+    def destroy(self):
+        super().destroy()
+        self.mode = self.error = self.column = self.direction = None

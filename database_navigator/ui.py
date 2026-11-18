@@ -22,42 +22,33 @@ import time
 from tkinter import ttk
 
 from . import __version__
+from .ui_table import DataTable
+from .ui_state import BrowsingState
 from .controller import NavigationController
-from .models import DEFAULT_LIMIT, validate_limit
-from .service import DEFAULT_DATABASE, open_service
-from .property_dialog import PropertyDialog
-from .relationship_dialog import RelationshipDialog
-from .diagram_dialog import DiagramDialog
+from .navigation import DEFAULT_DATABASE, open_navigation, validate_limit
+from .ui_columns_dialog import ColumnsDialog
+from .ui_order_dialog import OrderDialog
+from .ui_relationship_dialog import RelationshipDialog
+from .ui_diagram_dialog import DiagramDialog
+from .ui_table_dialog import TableDialog
 
 
-class ResultGrid(ttk.Frame):
-    def __init__(self, parent, height=5):
-        super().__init__(parent)
-        self.tree = ttk.Treeview(self, show="headings", selectmode="browse", height=height)
-        vertical = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        horizontal = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vertical.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+__all__ = ["Navigator", "main"]
 
-    def show(self, columns, rows):
-        self.tree.delete(*self.tree.get_children())
-        ids = [str(i) for i in range(len(columns))]
-        self.tree.configure(columns=ids)
-        for identifier, name in zip(ids, columns):
-            self.tree.heading(identifier, text=name)
-            self.tree.column(identifier, width=130, minwidth=70, stretch=False)
-        for index, row in enumerate(rows):
-            self.tree.insert("", "end", iid=str(index), values=[
-                "NULL" if value is None else str(value) for value in row
-            ])
+
+DEFAULT_LIMIT = 50
 
 
 class RelatedContent(ttk.Frame):
     """Content for the single selected relationship."""
+
+    @property
+    def columns(self):
+        return self.grid.columns if self.grid is not None else ()
+
+    @property
+    def rows(self):
+        return self.grid.rows if self.grid is not None else []
 
     def __init__(self, parent, link, selected_table, open_button):
         super().__init__(parent, padding=8, relief="groove", borderwidth=1)
@@ -68,8 +59,7 @@ class RelatedContent(ttk.Frame):
         self.primary_key = None
         self.primary_key_error = None
         self.grid = None
-        self.columns, self.rows = (), []
-        self.row_selection = ()
+        self.row_selection = None
         self.row_selection_revision = 0
         header = ttk.Frame(self)
         header.pack(fill="x")
@@ -92,8 +82,7 @@ class RelatedContent(ttk.Frame):
 
     def clear(self, message=None):
         self.grid = None
-        self.columns, self.rows = (), []
-        self.row_selection = ()
+        self.row_selection = None
         self.row_selection_revision += 1
         for widget in self.content.winfo_children():
             widget.destroy()
@@ -102,20 +91,44 @@ class RelatedContent(ttk.Frame):
 
     def show_result(self, result, limit):
         self.clear()
-        columns, rows = self.columns, self.rows = result
-        grid = self.grid = ResultGrid(self.content, height=12)
+        columns, rows = result
+        grid = self.grid = DataTable(self.content, height=12)
         grid.pack(fill="both", expand=True, pady=5)
         grid.show(columns, rows)
         ttk.Label(self.content, text=f"{len(rows)} rows fetched · limit {limit}").pack(anchor="w")
 
 
+def _wrap_control_groups(container, first, second, *, align):
+    """Keep control groups on separate rows when their full labels need space."""
+    container.columnconfigure(0, weight=1)
+    first.grid(row=0, column=0, sticky=align)
+    second.grid(row=0, column=1, sticky='e', padx=(8, 0))
+
+    def arrange(event):
+        narrow = event.width < first.winfo_reqwidth() + second.winfo_reqwidth() + 8
+        second.grid_configure(row=1 if narrow else 0, column=0 if narrow else 1,
+                              padx=0 if narrow else (8, 0), pady=(6, 0) if narrow else 0)
+
+    container.bind('<Configure>', arrange)
+
+
 class Navigator(ttk.Frame):
-    def __init__(self, root, service):
+    @property
+    def columns(self):
+        return self.results.columns if self.results is not None else ()
+
+    @property
+    def rows(self):
+        return self.results.rows if self.results is not None else []
+
+    def __init__(self, root, navigation):
         super().__init__(root, padding=12)
-        self.service = service
-        self.controller = NavigationController(service)
-        self.model = service.model
+        self.navigation = navigation
+        self.state = BrowsingState()
+        self.controller = NavigationController(navigation, self.state)
+        self.model = navigation.model
         self.property_dialog = None
+        self.table_dialog = None
         self.relationship_dialog = None
         self.help_dialog = None
         self.diagram_dialog = None
@@ -127,9 +140,9 @@ class Navigator(ttk.Frame):
         self._last_selection = None
         self._stage = "Ready. Press Send to execute the query."
         self._stage_started = time.monotonic()
-        self.columns, self.rows, self.links = (), [], []
+        self.links = []
         self.pack(fill="both", expand=True)
-        root.title(f"Database Navigator {__version__} — {service.label} (read-only)")
+        root.title(f"Database Navigator {__version__} — {navigation.label} (read-only)")
         root.geometry("1200x800")
         root.minsize(800, 550)
         # Ask the window manager for its usable desktop area, preserving the
@@ -145,27 +158,32 @@ class Navigator(ttk.Frame):
 
         toolbar = ttk.Frame(self)
         toolbar.pack(fill="x", pady=(0, 6))
-        self.back_button = ttk.Button(toolbar, text="Back", state="disabled", command=lambda: self.move_history(-1))
+        browsing_controls = ttk.Frame(toolbar)
+        tool_controls = ttk.Frame(toolbar)
+        self.back_button = ttk.Button(browsing_controls, text="Back", state="disabled", command=lambda: self.move_history(-1))
         self.back_button.pack(side="left", padx=(12, 4))
-        self.forward_button = ttk.Button(toolbar, text="Forward", state="disabled", command=lambda: self.move_history(1))
+        self.forward_button = ttk.Button(browsing_controls, text="Forward", state="disabled", command=lambda: self.move_history(1))
         self.forward_button.pack(side="left")
-        self.reset_metadata_button = ttk.Button(toolbar, text="Reset cache", command=self.reset_metadata)
+        self.choose_table_button = ttk.Button(browsing_controls, text='Choose table…', command=self.choose_table)
+        self.choose_table_button.pack(side='left', padx=(8, 0))
+        self.reset_metadata_button = ttk.Button(browsing_controls, text="Reset cache", command=self.reset_metadata)
         self.reset_metadata_button.pack(side="left", padx=8)
         self.relationships_button = ttk.Button(
-            toolbar, text='Relationships', command=self.manage_relationships,
+            tool_controls, text='Manage relationships', command=self.manage_relationships,
             state='normal' if self.model else 'disabled')
         self.relationships_button.pack(side='left', padx=(0, 8))
-        self.diagram_button = ttk.Button(toolbar, text='Diagram', state='disabled', command=self.show_diagram)
+        self.diagram_button = ttk.Button(tool_controls, text='View diagram', state='disabled', command=self.show_diagram)
         self.diagram_button.pack(side='left', padx=(0, 8))
-        self.help_button = ttk.Button(toolbar, text='Help', command=self.show_help)
+        self.help_button = ttk.Button(tool_controls, text='Help', command=self.show_help)
         self.help_button.pack(side='left')
         self.limit = tk.StringVar(value=str(DEFAULT_LIMIT))
-        self.limit_box = ttk.Spinbox(toolbar, from_=1, to=10000, width=6,
+        self.limit_box = ttk.Spinbox(tool_controls, from_=1, to=10000, width=6,
                                      textvariable=self.limit, command=self.change_limit)
         self.limit_box.pack(side="right", padx=8)
         self.limit_box.bind("<Return>", self.change_limit)
         self.limit_box.bind("<FocusOut>", self.change_limit)
-        ttk.Label(toolbar, text="Row limit (each table)").pack(side="right")
+        ttk.Label(tool_controls, text="Row limit (each table)").pack(side="right")
+        _wrap_control_groups(toolbar, browsing_controls, tool_controls, align='w')
         self.status = tk.StringVar(value="Ready. Press Send to execute the query.")
         ttk.Label(self, textvariable=self.status, wraplength=1100).pack(fill="x", pady=8)
 
@@ -217,10 +235,10 @@ class Navigator(ttk.Frame):
         rows_pane = ttk.Frame(master)
         master.add(rows_pane, weight=1)
         ttk.Label(rows_pane, text="Master rows", font=("TkDefaultFont", 12, "bold")).pack(anchor="w", pady=(8, 0))
-        self.results = ResultGrid(rows_pane, height=20)
+        self.results = DataTable(rows_pane, height=20)
         self.results.pack(fill="both", expand=True, pady=(8, 0))
-        self.results.tree.bind("<<TreeviewSelect>>", self.select_row)
-        self.bind_grid_shortcuts(self.results.tree)
+        self.results.bind_event("<<TreeviewSelect>>", self.select_row)
+        self.bind_grid_shortcuts(self.results)
         details = self.details = ttk.Panedwindow(right, orient="vertical")
         details.pack(fill="both", expand=True)
         navigation = ttk.Frame(details)
@@ -230,22 +248,25 @@ class Navigator(ttk.Frame):
         direction_bar.pack(fill="x", pady=(8, 0))
         action_bar = ttk.Frame(navigation)
         action_bar.pack(fill='x', pady=(8, 0))
-        self.open_button = ttk.Button(action_bar, text="Open table", state="disabled",
+        query_controls = ttk.Frame(action_bar)
+        open_controls = ttk.Frame(action_bar)
+        self.open_button = ttk.Button(open_controls, text="Open table", state="disabled",
                                       command=lambda: self.open_related(self.related_content))
         self.open_button.pack(side="right", padx=(6, 0))
-        self.open_row_button = ttk.Button(action_bar, text='Open row', state='disabled',
+        self.open_row_button = ttk.Button(open_controls, text='Open row', state='disabled',
                                           command=self.open_row)
         self.open_row_button.pack(side='right', padx=(6, 0))
-        self.columns_button = ttk.Button(action_bar, text='Columns', state='disabled',
+        self.columns_button = ttk.Button(query_controls, text='Choose columns…', state='disabled',
                                          command=lambda: self.edit_property('columns'))
         self.columns_button.pack(side='right', padx=(6, 0))
-        self.order_button = ttk.Button(action_bar, text='Order', state='disabled',
+        self.order_button = ttk.Button(query_controls, text='Set sort order…', state='disabled',
                                        command=lambda: self.edit_property('order_by'))
         self.order_button.pack(side='right', padx=(6, 0))
+        _wrap_control_groups(action_bar, query_controls, open_controls, align='e')
         ttk.Label(direction_bar, text="Show:").pack(side="left", padx=(0, 6))
-        self.related_direction = tk.StringVar(value="Child")
+        self.related_direction = tk.StringVar(value="Parent")
         self.direction_buttons = []
-        for direction in ("Any", "Child", "Parent"):
+        for direction in ("Parent", "Child"):
             button = ttk.Radiobutton(direction_bar, text=direction, value=direction,
                                      variable=self.related_direction, state='disabled')
             button.pack(side="left", padx=(0, 6))
@@ -306,14 +327,14 @@ class Navigator(ttk.Frame):
         self._poll_id = self.after(40, self._poll)
         if self.model:
             self._set_stage(f'Loading startup SQL for {self.model}…')
-            self.controller.queue_ordered(self.service.startup_sql, (), self.startup_sql_ready, self.startup_sql_failed)
+            self.controller.queue_ordered(self.navigation.startup_sql, (), self.startup_sql_ready, self.startup_sql_failed)
         self.editor.focus_set()
 
     def show_diagram(self):
         if not self._links_ready:
             return
         if self.diagram_dialog is None or not self.diagram_dialog.winfo_exists():
-            self.diagram_dialog = DiagramDialog(self, self.select_diagram_link, self.service.table_key)
+            self.diagram_dialog = DiagramDialog(self, self.select_diagram_link, self.navigation.table_key)
         self.diagram_dialog.lift()
         self.update_diagram()
 
@@ -333,7 +354,7 @@ class Navigator(ttk.Frame):
             return
         dialog.snapshot = snapshot
         dialog.message('Loading relationships…')
-        table = self.service.base_table(self.controller.visit.query.statement)
+        table = self.navigation.base_table(self.controller.visit.query.statement)
 
         def current():
             return (not self.controller.closed and bool(dialog.winfo_exists())
@@ -344,7 +365,7 @@ class Navigator(ttk.Frame):
             dialog.message(f'Could not load diagram: {exc}')
 
         self.controller.submit(
-            self.service.relationship_diagram, (table,),
+            self.navigation.relationship_diagram, (table,),
             lambda result: dialog.show(*result, self.related_index),
             failed, current)
 
@@ -355,8 +376,9 @@ class Navigator(ttk.Frame):
         # the list's temporary search or direction filter currently hides it.
         if not self.related_list.exists(str(index)):
             self._links_ready = False
-            self.related_direction.set('Any')
-            self.controller.set_filters(direction='Any', search='')
+            direction = self.links[index].direction.title()
+            self.related_direction.set(direction)
+            self.controller.set_filters(direction=direction, search='')
             self.related_search.set('')
             self._links_ready = True
             self.populate_related()
@@ -429,12 +451,13 @@ class Navigator(ttk.Frame):
         self._editor_focus_revision += 1
 
     def bind_grid_shortcuts(self, tree):
+        bind = tree.bind_event if isinstance(tree, DataTable) else tree.bind
         for key in ('c', 'C', 'e'):
-            tree.bind(f'<Key-{key}>', self.move_grid_focus)
+            bind(f'<Key-{key}>', self.move_grid_focus)
         for key in ('n', 'p'):
-            tree.bind(f'<Key-{key}>', self.move_grid_row)
+            bind(f'<Key-{key}>', self.move_grid_row)
         for key in ('b', 'f'):
-            tree.bind(f'<Key-{key}>', self.move_grid_history)
+            bind(f'<Key-{key}>', self.move_grid_history)
 
     def move_grid_history(self, event):
         if self.grid_shortcut_modified(event):
@@ -464,47 +487,47 @@ class Navigator(ttk.Frame):
             return 'break'
         direction = 1 if event.keysym == 'c' else -1
         section = self.related_content
-        detail_tree = section.grid.tree if section is not None and section.grid is not None else None
-        panes = (self.results.tree, self.related_list, detail_tree)
+        detail_tree = section.grid if section is not None and section.grid is not None else None
+        panes = (self.results, self.related_list, detail_tree)
         if event.widget in panes:
             index = panes.index(event.widget)
             for step in range(1, len(panes) + 1):
                 target = panes[(index + step * direction) % len(panes)]
-                if (target is not None and target.winfo_ismapped()
-                        and not target.instate(['disabled']) and target.get_children()):
-                    if target is detail_tree:
-                        selected = target.selection()
-                        row = selected[0] if selected else target.get_children()[0]
-                        if not selected:
-                            target.selection_set(row)
-                        target.focus(row)
-                        target.see(row)
+                if isinstance(target, DataTable):
+                    if target.can_focus():
+                        if target is detail_tree:
+                            target.focus_selection()
+                        else:
+                            target.focus_set()
+                        break
+                elif (target is not None and target.winfo_ismapped()
+                      and not target.instate(['disabled']) and target.get_children()):
                     target.focus_set()
                     break
         return 'break'
 
     def bind_detail_shortcuts(self, tree):
-        tree.bind('<Key-o>', self.open_from_details)
-        tree.bind('<Control-o>', lambda event: self.open_from_details(event, row=False))
+        tree.bind_event('<Key-o>', self.open_from_details)
+        tree.bind_event('<Control-o>', lambda event: self.open_from_details(event, row=False))
         if self.tk.call('tk', 'windowingsystem') == 'aqua':
-            tree.bind('<Command-o>', lambda event: self.open_from_details(event, row=False))
+            tree.bind_event('<Command-o>', lambda event: self.open_from_details(event, row=False))
 
     def open_from_details(self, event, *, row=True):
         if row and self.grid_shortcut_modified(event):
             return
         section = self.related_content
-        if section is not None and section.grid is not None and event.widget is section.grid.tree:
+        if section is not None and section.grid is not None and event.widget is section.grid:
             button = self.open_row_button if row else self.open_button
             button.invoke()
         return 'break'
 
     def startup_sql_ready(self, text):
         if (self._editor_revision == 0 and not self.editor.edit_modified()
-                and self.controller.history_index < 0 and not self.editor.get('1.0', 'end-1c')):
+                and self.state.history_index < 0 and not self.editor.get('1.0', 'end-1c')):
             self.editor.insert('1.0', text)
             self.editor.edit_reset()
         self.save_startup_button.configure(state='normal')
-        if self.controller.history_index < 0:
+        if self.state.history_index < 0:
             self._set_stage('Ready. Press Send to execute the query.')
 
     def startup_sql_failed(self, error):
@@ -528,7 +551,7 @@ class Navigator(ttk.Frame):
             self.save_startup_button.configure(state='normal')
             self._set_stage(f'Could not save startup SQL: {error}')
 
-        self.controller.queue_ordered(self.service.save_startup_sql, (text,), completed, failed)
+        self.controller.queue_ordered(self.navigation.save_startup_sql, (text,), completed, failed)
 
     def initialize_main_split(self, event):
         # Pane weights govern resizing, but initial widths otherwise come from
@@ -614,14 +637,14 @@ class Navigator(ttk.Frame):
         self.related_list.delete(*self.related_list.get_children())
 
     def capture_visit(self):
-        selected = self.results.tree.selection()
+        selected = self.results.selected_index()
         try:
             limit = self.row_limit()
         except ValueError:
             limit = None
         self.controller.capture_visit(
             search=self.related_search.get(), direction=self.related_direction.get(),
-            selected_index=int(selected[0]) if selected else None,
+            selected_index=selected,
             related_index=self.related_index, links_ready=self._links_ready, limit=limit)
 
     def history_buttons(self):
@@ -633,15 +656,15 @@ class Navigator(ttk.Frame):
             return
         self.capture_visit()
         self.activate_visit(self.controller.move_history(offset))
-        self.results.tree.focus_set()
+        self.results.focus_set()
 
     def open_related(self, section):
-        selected = self.results.tree.selection()
-        if section is None or not selected or not self.rows:
+        selected = self.results.selected_index()
+        if section is None or selected is None or not self.rows:
             self._set_stage("Select a row before opening a related table.")
             return
         try:
-            args = (section.link, self.columns, self.rows[int(selected[0])], self.row_limit())
+            args = (section.link, self.results.selected_row(), self.row_limit())
         except ValueError as exc:
             self._set_stage(f"Error: {exc}")
             return
@@ -664,7 +687,7 @@ class Navigator(ttk.Frame):
         self.open_row_button.configure(state='disabled')
         if section is None:
             return
-        selected = section.grid.tree.selection() if section.grid is not None else ()
+        selected = section.grid.selected_index() if section.grid is not None else None
         if selected != section.row_selection:
             section.row_selection = selected
             section.row_selection_revision += 1
@@ -674,12 +697,11 @@ class Navigator(ttk.Frame):
             reason = 'Reading primary key…'
         elif not section.primary_key:
             reason = 'This table has no declared primary key.'
-        elif not selected:
+        elif selected is None:
             reason = 'Select a related row to open it.'
         else:
             try:
-                self.service.validate_row_key(section.primary_key, section.columns,
-                                              section.rows[int(selected[0])])
+                self.navigation.validate_row_key(section.primary_key, section.grid.selected_row())
             except ValueError as exc:
                 reason = str(exc)
             else:
@@ -705,9 +727,9 @@ class Navigator(ttk.Frame):
         self.update_open_row()
         if section is None or self.open_row_button.instate(['disabled']):
             return
-        selected = section.grid.tree.selection()
+        selected = section.grid.selected_index()
         try:
-            args = (section.link, section.columns, section.rows[int(selected[0])], self.row_limit())
+            args = (section.link, section.grid.selected_row(), self.row_limit())
         except ValueError as exc:
             self._set_stage(f'Error: {exc}')
             return
@@ -717,7 +739,7 @@ class Navigator(ttk.Frame):
         editor_revision = self._editor_revision
         current = lambda: (section is self.related_content and revision == section.revision
                            and row_revision == section.row_selection_revision
-                           and section.grid is not None and section.grid.tree.selection() == selected)
+                           and section.grid is not None and section.grid.selected_index() == selected)
 
         def prepared(query):
             if self._editor_revision != editor_revision or self.editor.edit_modified():
@@ -729,6 +751,52 @@ class Navigator(ttk.Frame):
         self.controller.open_row(*args, prepared=prepared,
                                  failed=lambda exc: self._set_stage(f'Error: {exc}'), current=current)
 
+    def choose_table(self):
+        if self.table_dialog is not None and self.table_dialog.winfo_exists():
+            self.table_dialog.lift()
+            return
+
+        def load(dialog):
+            revision = dialog.revision
+            # Dialog reads survive navigation changes and follow pending preference saves.
+            self.controller.queue_ordered(self.navigation.list_tables, (), dialog.loaded, dialog.load_failed,
+                lambda: not self.controller.closed and bool(dialog.winfo_exists()) and revision == dialog.revision)
+
+        self.table_dialog = TableDialog(self, load, self.open_chosen_table)
+
+    def open_chosen_table(self, dialog, ref):
+        try:
+            limit = self.row_limit()
+        except ValueError as exc:
+            dialog.open_failed(exc)
+            return
+        self.editor_modified()
+        editor_revision = self._editor_revision
+        request_revision = self.state.request_revision
+        self.state.open_revision += 1
+        open_revision = self.state.open_revision
+        revision = dialog.revision
+
+        def prepared(query):
+            if self._editor_revision != editor_revision or self.editor.edit_modified():
+                dialog.open_failed('Open cancelled because Free SQL changed. Choose Open to try again.')
+                return
+            if request_revision != self.state.request_revision or open_revision != self.state.open_revision:
+                dialog.open_failed('Open cancelled because navigation changed. Choose Open to try again.')
+                return
+            try:
+                if limit != self.row_limit():
+                    raise ValueError('Row limit changed. Choose Open to try again.')
+                self.controller.query_for_text('', query)
+            except ValueError as exc:
+                dialog.open_failed(exc)
+                return
+            dialog.destroy()
+            self.send(navigation=query)
+
+        self.controller.queue_ordered(self.navigation.table_query, (ref, limit), prepared, dialog.open_failed,
+            lambda: not self.controller.closed and bool(dialog.winfo_exists()) and revision == dialog.revision)
+
     def manage_relationships(self):
         if not self.model:
             return
@@ -736,7 +804,7 @@ class Navigator(ttk.Frame):
             self.relationship_dialog.lift()
             return
         visit = self.controller.visit
-        source = self.service.relationship_source(visit.query if visit else None)
+        child_table = self.navigation.initial_child_table(visit.query if visit else None)
 
         def request(dialog, operation, args, completed, failed):
             # Use the ordered local-storage queue so navigation never cancels a save.
@@ -744,7 +812,7 @@ class Navigator(ttk.Frame):
                                 lambda: not self.controller.closed and bool(dialog.winfo_exists()))
 
         self.relationship_dialog = RelationshipDialog(
-            self, self.model, source, self.service, request, self.reset_metadata)
+            self, self.model, child_table, self.navigation, request, self.reset_metadata)
 
     def edit_property(self, property_name):
         section = self.related_content
@@ -762,8 +830,10 @@ class Navigator(ttk.Frame):
         def ready(result):
             columns, saved = result
             self.related_status()
-            self.property_dialog = PropertyDialog(
-                self, section.link, property_name, columns, saved, save)
+            dialog_type = {'columns': ColumnsDialog, 'order_by': OrderDialog}[property_name]
+            self.property_dialog = dialog_type(
+                self, section.link, columns, saved.get(property_name), save,
+                error=saved.get(f'{property_name}_error', ''))
 
         def save(dialog, choices):
             def completed(_):
@@ -771,11 +841,11 @@ class Navigator(ttk.Frame):
                 # Refresh only this selection; never rewrite free SQL or main results.
                 if section is self.related_content:
                     self.select_row()
-            self.controller.queue_ordered(self.service.save_preference, (section.link, property_name, choices),
+            self.controller.queue_ordered(self.navigation.save_preference, (section.link, property_name, choices),
                          completed, dialog.failed,
                          lambda: not self.controller.closed and bool(dialog.winfo_exists()))
 
-        self.controller.submit(self.service.table_preferences, (section.link,), ready,
+        self.controller.submit(self.navigation.table_preferences, (section.link,), ready,
                      lambda exc: self._set_stage(f'Error: {exc}'), current)
 
     def send_from_button(self):
@@ -793,7 +863,7 @@ class Navigator(ttk.Frame):
         visit = self.controller.add_visit(query, limit)
         self.activate_visit(visit, focus_results=focus_results)
         if navigation is not None:
-            self.results.tree.focus_set()
+            self.results.focus_set()
         return "break"
 
     def reset_metadata(self):
@@ -808,12 +878,14 @@ class Navigator(ttk.Frame):
             self.editor.insert("1.0", text)
         elif visit is None:
             self._set_stage("Metadata cache cleared. Press Send to execute the query.")
+        if self.table_dialog is not None and self.table_dialog.winfo_exists():
+            self.table_dialog.reload()
 
     def activate_visit(self, visit, *, focus_results=False):
         self.controller.begin_visit()
         self._last_selection = None
         self.clear_sections()
-        self.columns, self.rows, self.links = (), [], []
+        self.links = []
         self._links_ready = False
         self.update_diagram()
         self.related_search.set(visit.search)
@@ -827,7 +899,7 @@ class Navigator(ttk.Frame):
             self.editor.insert("1.0", visit.query.text)
         self.limit.set(str(visit.limit))
         self.history_buttons()
-        table = self.service.base_table(visit.query.statement)
+        table = self.navigation.base_table(visit.query.statement)
         self.editor_modified()
         editor_revision, focus_revision = self._editor_revision, self._editor_focus_revision
 
@@ -854,8 +926,7 @@ class Navigator(ttk.Frame):
             self.select_related()
 
         def rows_ready(result):
-            self.columns, self.rows = result
-            self.results.show(self.columns, self.rows)
+            self.results.show(*result)
             if not self.rows:
                 self._set_stage(f"{table}: no rows found.")
                 ttk.Label(self.sections, text="No rows selected.").pack(anchor="w")
@@ -863,13 +934,11 @@ class Navigator(ttk.Frame):
                 return
             if visit.selected_index is not None:
                 index = min(visit.selected_index, len(self.rows) - 1)
-                self.results.tree.selection_set(str(index))
-                self.results.tree.focus(str(index))
-                self.results.tree.see(str(index))
+                self.results.select(index)
                 if (focus_results and self.focus_get() is self.editor
                         and focus_revision == self._editor_focus_revision
                         and editor_revision == self._editor_revision and not self.editor.edit_modified()):
-                    self.results.tree.focus_set()
+                    self.results.focus_set()
 
         def query_failed(exc):
             self._set_stage(f'Error: {exc}')
@@ -890,21 +959,21 @@ class Navigator(ttk.Frame):
         self.select_row()
 
     def select_row(self, event=None):
-        signature = (self.results.tree.selection(), self.related_index, self.limit.get())
+        signature = (self.results.selected_index(), self.related_index, self.limit.get())
         if event is not None and signature == self._last_selection:
             return
         self._last_selection = signature
         self.controller.change_selection()
         if not self._links_ready:
             self.clear_sections()
-            if self.results.tree.selection() and self.rows:
+            if self.results.selected_index() is not None and self.rows:
                 text = self._relationship_error or "Discovering relationships…"
                 ttk.Label(self.sections, text=text, wraplength=440).pack(anchor="w")
             return
         section = self.related_content
         if section is not None:
             self.open_row_button.configure(state='disabled')
-            selected = bool(self.results.tree.selection() and self.rows)
+            selected = bool(self.results.selected_index() is not None and self.rows)
             section.open_button.configure(state="normal" if selected else "disabled")
             section.cancel_read()
             section.clear()
@@ -913,7 +982,7 @@ class Navigator(ttk.Frame):
 
     def populate_related(self):
         self.related_list.delete(*self.related_list.get_children())
-        table = self.service.base_table(self.controller.visit.query.statement)
+        table = self.navigation.base_table(self.controller.visit.query.statement)
         for index in self.controller.visible_links(
                 self.links, self.related_search.get(), self.related_direction.get()):
             self.related_list.insert("", "end", iid=str(index), values=(self.links[index].notation(table),))
@@ -975,7 +1044,7 @@ class Navigator(ttk.Frame):
         self.related_index = index
         self.update_diagram()
         if index is not None:
-            table = self.service.base_table(self.controller.visit.query.statement)
+            table = self.navigation.base_table(self.controller.visit.query.statement)
             self.related_content = RelatedContent(self.sections, self.links[index], table, self.open_button)
             self.related_content.pack(fill="both", expand=True, pady=(8, 0))
             self.load_primary_key(self.related_content)
@@ -1008,18 +1077,18 @@ class Navigator(ttk.Frame):
 
     def load_related(self, section):
         self.show_generated_sql()
-        selected = self.results.tree.selection()
-        if not selected or not self.rows:
+        selected = self.results.selected_index()
+        if selected is None or not self.rows:
             section.clear("No row selected.")
             self.update_open_row()
             return
         try:
             limit = self.row_limit()
+            row = self.results.selected_row()
         except ValueError as exc:
             section.clear(str(exc))
             self.update_open_row()
             return
-        row = self.rows[int(selected[0])]
         revision = section.revision
         current = lambda: (section is self.related_content
                            and revision == section.revision)
@@ -1034,14 +1103,14 @@ class Navigator(ttk.Frame):
                 section.clear(str(error))
             else:
                 section.show_result(result, limit)
-                section.grid.tree.bind('<<TreeviewSelect>>', self.update_open_row)
-                self.bind_grid_shortcuts(section.grid.tree)
-                self.bind_detail_shortcuts(section.grid.tree)
+                section.grid.bind_event('<<TreeviewSelect>>', self.update_open_row)
+                self.bind_grid_shortcuts(section.grid)
+                self.bind_detail_shortcuts(section.grid)
             self.update_open_row()
             self.related_status()
 
         section.future = self.controller.load_related(
-            section.link, self.columns, row, limit,
+            section.link, row, limit,
             prepared=lambda query: self.show_generated_sql(query, section.link.display_table),
             completed=complete, failed=lambda exc: complete(error=exc), current=current)
 
@@ -1056,16 +1125,16 @@ def main():
                         help='Local SQLite preferences file (default: database-navigator.sqlite)')
     args = parser.parse_args()
     try:
-        service = open_service(args.connection, model=args.model,
+        navigation = open_navigation(args.connection, model=args.model,
                                application_database=args.application_database)
     except ValueError as exc:
         parser.exit(1, f"Error: {exc}\n")
     try:
         root = tk.Tk()
-        Navigator(root, service)
+        Navigator(root, navigation)
         root.mainloop()
     finally:
-        service.close()
+        navigation.close()
 
 
 if __name__ == "__main__":

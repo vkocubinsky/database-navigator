@@ -78,7 +78,7 @@ The model is a name you choose for a database structure. It enables saved
 preferences, startup SQL, and custom relationships. If omitted, `--model` uses
 `default`. Connections using the same model and application database share these
 settings; choose distinct model names for unrelated databases. Custom relationships are defined through
-**Relationships** with a model; importing relationship files is not supported.
+**Manage relationships** with a model; importing relationship files is not supported.
 
 ### SQLite
 
@@ -149,19 +149,28 @@ directory, even when invoked from elsewhere. Relative paths are resolved there.
 By default, model preferences are stored in `database-navigator.sqlite` in that
 directory. This file must be separate from the database being browsed. Keep it
 private: it can contain saved SQL and database relationship details.
+If Navigator reports an old relationship schema, use `--application-database`
+with a new file path to start with fresh preferences.
 
 ## Browse data
 
-Enter a SELECT query for one of your tables in **Free SQL**, then click **Send**.
-Select a master row and a relationship to see related rows. **Child**, **Parent**,
-and **Any** filter relationship direction. **Open table** and **Open row** move
+Click **Choose table…** in the top toolbar to browse tables and views. Search by
+part of a name or a case-insensitive pattern such as `customer*`, `public.*`, or
+`pu*.cus*`; `*`, `?`, and bracket patterns are supported. **Open** fills Free SQL
+and runs the query with the saved columns, sort order, and current row limit. Enter or
+double-click opens the selected table; Escape cancels. **Reset cache** refreshes
+the table list. Saved startup SQL is unchanged.
+
+You can also enter a SELECT query in **Free SQL**, then click **Send**.
+Select a master row and a relationship to see related rows. **Parent** follows the row’s foreign key. **Child** shows rows that refer to it.
+New visits default to **Parent** until a relationship is remembered. **Open table** and **Open row** move
 related data into the master view; **Back** and **Forward** navigate history.
 
 - Composite foreign keys and relationships across PostgreSQL schemas are supported.
-- **Relationships** manages additional local relationship declarations when
+- **Manage relationships** manages additional local relationship declarations when
   using a model, without changing database constraints.
-- **Diagram** shows the current table's direct relationships.
-- **Columns** and **Order** customize related-table queries for a model.
+- **View diagram** shows the current table's direct relationships.
+- **Choose columns…** and **Set sort order…** customize related-table queries for a model.
 - **Generated SQL** shows the query used to retrieve related rows.
 - **Set as startup** saves editor text for a model. Startup never runs it automatically.
 - **Help** lists keyboard shortcuts.

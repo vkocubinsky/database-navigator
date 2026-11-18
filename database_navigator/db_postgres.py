@@ -17,17 +17,31 @@
 """PostgreSQL dialect, read-only backend, connections, and metadata discovery."""
 
 from contextlib import contextmanager
-from dataclasses import replace
 import re
+from typing import Literal
 
-from .models import ForeignKey, Relationship, TableNotFoundError, validate_limit
-from .queries import (derived_reference, navigation_query, parse_table, primary_key_values,
-                      relationship_values, selected_sql)
+from .contracts import TableNotFoundError
+from .metadata_models import Column, Relationship, Table, TableDetails, TableRef, TableSummary
+from .navigation import (derived_reference, parse_table, primary_key_values, validate_limit)
 
 
 # PostgreSQL 18 keywords that cannot be ordinary table/column names (ColId):
 # RESERVED_KEYWORD and TYPE_FUNC_NAME_KEYWORD. Keep validation offline and pure.
 # https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/parser/kwlist.h
+
+
+__all__ = [
+    "PostgreSQLBackend",
+    "PostgreSQLDialect",
+    "PostgreSQLError",
+    "POSTGRESQL",
+    "connect_read_only",
+    "read_operation",
+    "postgres_primary_key",
+    "postgres_foreign_keys",
+]
+
+
 _POSTGRES_QUOTED_NAMES = frozenset('''
 all analyse analyze and any array as asc asymmetric authorization binary both case cast
 check collate collation column concurrently constraint create cross current_catalog
@@ -73,11 +87,25 @@ class PostgreSQLDialect:
     def split_reference(self, reference):
         return parse_table(reference, postgres=True)
 
-    def relationship_schema(self, schema):
-        return schema
-
     def validate_row_key(self, key, columns, row):
         return primary_key_values(key, columns, row, self.identifier_key)
+
+    placeholder = '%s'
+
+    def sql_table(self, ref):
+        return qualified_table(ref.name, ref.schema)
+
+    def sql_column(self, ref, name):
+        return postgres_identifier(name)
+
+    def sql_literal(self, value):
+        import psycopg
+        from psycopg import sql
+
+        try:
+            return sql.Literal(value).as_string().strip()
+        except psycopg.Error as exc:
+            raise ValueError(f"Cannot display this relationship key ({type(exc).__name__}).") from None
 
 
 POSTGRESQL = PostgreSQLDialect()
@@ -223,10 +251,12 @@ def postgres_primary_key(connection, table: str, schema: str | None = None) -> t
 
 
 def postgres_foreign_keys(connection, table: str, schema: str | None = None,
-                          *, incoming: bool = False) -> list[ForeignKey]:
-    """Read outgoing (or incoming) keys; omitted schema follows search_path."""
+                          *, direction: Literal['parent', 'child'] = 'parent') -> list[Relationship]:
+    """Read relationships leading to the selected table’s parents or children."""
     from psycopg.rows import tuple_row
 
+    if direction not in ('parent', 'child'):
+        raise ValueError('Unknown navigation direction.')
     with connection.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             """
@@ -243,11 +273,11 @@ def postgres_foreign_keys(connection, table: str, schema: str | None = None,
             raise TableNotFoundError(f"Table not found: {schema + '.' if schema else ''}{table}")
         oid = found[0]
         # This fragment is selected internally, never supplied by the caller.
-        relation_column = "confrelid" if incoming else "conrelid"
+        relation_column = "confrelid" if direction == "child" else "conrelid"
         cursor.execute(
             f"""
-            SELECT fk.conname, source_ns.nspname, source.relname,
-                   ns.nspname, target.relname,
+            SELECT fk.conname, child_ns.nspname, child.relname,
+                   parent_ns.nspname, parent.relname,
                    ARRAY(SELECT a.attname
                          FROM unnest(fk.conkey) WITH ORDINALITY AS k(num, position)
                          JOIN pg_catalog.pg_attribute a
@@ -259,18 +289,22 @@ def postgres_foreign_keys(connection, table: str, schema: str | None = None,
                            ON a.attrelid = fk.confrelid AND a.attnum = k.num
                          ORDER BY k.position)
             FROM pg_catalog.pg_constraint fk
-            JOIN pg_catalog.pg_class source ON source.oid = fk.conrelid
-            JOIN pg_catalog.pg_namespace source_ns ON source_ns.oid = source.relnamespace
-            JOIN pg_catalog.pg_class target ON target.oid = fk.confrelid
-            JOIN pg_catalog.pg_namespace ns ON ns.oid = target.relnamespace
+            JOIN pg_catalog.pg_class child ON child.oid = fk.conrelid
+            JOIN pg_catalog.pg_namespace child_ns ON child_ns.oid = child.relnamespace
+            JOIN pg_catalog.pg_class parent ON parent.oid = fk.confrelid
+            JOIN pg_catalog.pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace
             WHERE fk.{relation_column} = %s AND fk.contype = 'f'
             ORDER BY fk.conname, fk.oid
             """, (oid,),
         )
-        return [ForeignKey(
-            name, source_schema, source_table, tuple(source_columns),
-            target_schema, target_table, tuple(target_columns),
-        ) for name, source_schema, source_table, target_schema, target_table, source_columns, target_columns
+        return [Relationship(
+            parent_table=TableRef(parent_schema, parent_table),
+            child_table=TableRef(child_schema, child_table),
+            parent_key=tuple(parent_key),
+            child_key=tuple(child_key),
+            origin='database',
+            name=name,
+        ) for name, child_schema, child_table, parent_schema, parent_table, child_key, parent_key
             in cursor.fetchall()]
 
 
@@ -306,32 +340,81 @@ class PostgreSQLBackend:
         schema, table = derived_reference(query, postgres=True)
         return qualified_table(table, schema)
 
-    def resolve_table(self, table):
+    def list_tables(self) -> tuple[TableSummary, ...]:
+        from psycopg.rows import tuple_row
+
+        connection = self.connection
+        with read_operation(connection), connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute('''
+                SELECT n.nspname, c.relname, c.relkind
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind IN ('r', 'p', 'f', 'v', 'm')
+                  AND n.nspname NOT LIKE 'pg!_%' ESCAPE '!'
+                  AND n.nspname <> 'information_schema'
+                ORDER BY n.nspname, c.relname
+            ''')
+            rows = cursor.fetchall()
+        return tuple(TableSummary(TableRef(schema, name),
+                                  {'v': 'view', 'm': 'materialized_view'}.get(kind, 'table'))
+                     for schema, name, kind in rows)
+
+    def resolve(self, name: str) -> TableRef:
         # to_regclass follows search_path for unqualified names.
-        with read_operation(self.connection):
-            with self.connection.cursor() as cursor:
+        connection = self.connection
+        with read_operation(connection):
+            with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT n.nspname, c.relname FROM pg_catalog.pg_class c "
                     "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-                    "WHERE c.oid = pg_catalog.to_regclass(%s)", (table,))
+                    "WHERE c.oid = pg_catalog.to_regclass(%s) "
+                    "AND c.relkind IN ('r', 'p', 'f', 'v', 'm')", (name,))
                 row = cursor.fetchone()
         if row is None:
-            raise TableNotFoundError(f"Table not found: {table}")
-        return tuple(row)
+            raise TableNotFoundError(f"Table not found: {name}")
+        return TableRef(*row)
 
-    def relationships(self, table):
-        schema, name = parse_table(table, postgres=True)
-        table = name
-        with read_operation(self.connection):
-            outgoing = postgres_foreign_keys(self.connection, table, schema)
-            incoming = postgres_foreign_keys(self.connection, table, schema, incoming=True)
-        result = [Relationship(key.target_table, key.target_columns, key.source_columns,
-                             "parent", key.target_schema)
-                for key in outgoing] + [
-                    Relationship(key.source_table, key.source_columns, key.target_columns,
-                                 "child", key.source_schema)
-                    for key in incoming]
-        return result
+    def table(self, ref):
+        from psycopg.rows import tuple_row
+
+        connection = self.connection
+        with read_operation(connection), connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute('''
+                SELECT c.oid, c.relkind
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relname = %s
+                  AND c.relkind IN ('r', 'p', 'f', 'v', 'm')
+            ''', (ref.schema, ref.name))
+            found = cursor.fetchone()
+            if found is None:
+                raise TableNotFoundError(f'Table not found: {ref.schema}.{ref.name}')
+            oid, kind = found
+            cursor.execute('''
+                SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod),
+                       NOT a.attnotnull
+                FROM pg_catalog.pg_attribute a
+                WHERE a.attrelid = %s AND a.attnum > 0 AND NOT a.attisdropped
+                ORDER BY a.attnum
+            ''', (oid,))
+            columns = tuple(Column(*row) for row in cursor.fetchall())
+            primary = postgres_primary_key(connection, ref.name, ref.schema)
+        return Table(ref, columns, primary, {'v': 'view', 'm': 'materialized_view'}.get(kind, 'table'))
+
+    def details(self, ref: TableRef) -> TableDetails:
+        table = self.table(ref)
+        return TableDetails(table, parent_relationships=self._parent_relationships(table.ref),
+                            child_relationships=self._child_relationships(table.ref))
+
+    def _parent_relationships(self, ref):
+        connection = self.connection
+        with read_operation(connection):
+            return tuple(postgres_foreign_keys(connection, ref.name, ref.schema))
+
+    def _child_relationships(self, ref):
+        connection = self.connection
+        with read_operation(connection):
+            return tuple(postgres_foreign_keys(connection, ref.name, ref.schema, direction='child'))
 
     def query(self, sql, limit, parameters=()):
         validate_limit(limit)
@@ -352,42 +435,9 @@ class PostgreSQLBackend:
                 columns = tuple(item.name for item in cursor.description)
                 return columns, cursor.fetchmany(limit)
 
-    def table_columns(self, relationship):
-        table = qualified_table(relationship.table, relationship.schema)
-        return self._read_bounded(f'SELECT * FROM {table} LIMIT 0', 1)[0]
-
-    def primary_key(self, table, schema=None):
-        with read_operation(self.connection):
-            return postgres_primary_key(self.connection, table, schema)
-
-    def row_navigation_query(self, relationship, columns, row, limit, selected_columns=None, order_by=()):
-        key = self.primary_key(relationship.table, relationship.schema)
-        self.dialect.validate_row_key(key, columns, row)
-        target = replace(relationship, columns=key, selected_columns=key)
-        return self.navigation_query(target, columns, row, limit, selected_columns, order_by)
-
     def execute_related_query(self, query, limit):
         # Generated queries always bind the row limit (and relationship keys),
         # so psycopg uses single-statement extended protocol without PREPARE.
         # Execute directly without a separate statement-preparation round trip.
         return self._read_bounded(query.statement, limit, query.parameters,
                                   prepare=not bool(query.parameters))
-
-    def _related_parts(self, relationship, columns, row, selected_columns, order_by):
-        values = relationship_values(relationship, columns, row, self.dialect)
-        table = qualified_table(relationship.table, relationship.schema)
-        names = tuple(map(postgres_identifier, relationship.columns))
-        projection, order = selected_sql(selected_columns, order_by, identifier=postgres_identifier)
-        return table, names, values, projection, order
-
-    def navigation_query(self, relationship, columns, row, limit, selected_columns=None, order_by=()):
-        import psycopg
-        from psycopg import sql
-
-        table, names, values, projection, order = self._related_parts(
-            relationship, columns, row, selected_columns, order_by)
-        try:
-            return navigation_query(table, names, values, limit, '%s',
-                                    lambda value: sql.Literal(value).as_string().strip(), projection, order)
-        except psycopg.Error as exc:
-            raise ValueError(f"Cannot display this relationship key ({type(exc).__name__}).") from None
