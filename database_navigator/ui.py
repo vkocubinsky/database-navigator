@@ -354,7 +354,7 @@ class Navigator(ttk.Frame):
             return
         dialog.snapshot = snapshot
         dialog.message('Loading relationships…')
-        table = self.navigation.base_table(self.controller.visit.query.statement)
+        table = self.navigation.base_table(self.controller.visit.query)
 
         def current():
             return (not self.controller.closed and bool(dialog.winfo_exists())
@@ -899,7 +899,7 @@ class Navigator(ttk.Frame):
             self.editor.insert("1.0", visit.query.text)
         self.limit.set(str(visit.limit))
         self.history_buttons()
-        table = self.navigation.base_table(visit.query.statement)
+        table = self.navigation.base_table(visit.query)
         self.editor_modified()
         editor_revision, focus_revision = self._editor_revision, self._editor_focus_revision
 
@@ -982,7 +982,7 @@ class Navigator(ttk.Frame):
 
     def populate_related(self):
         self.related_list.delete(*self.related_list.get_children())
-        table = self.navigation.base_table(self.controller.visit.query.statement)
+        table = self.navigation.base_table(self.controller.visit.query)
         for index in self.controller.visible_links(
                 self.links, self.related_search.get(), self.related_direction.get()):
             self.related_list.insert("", "end", iid=str(index), values=(self.links[index].notation(table),))
@@ -1044,7 +1044,7 @@ class Navigator(ttk.Frame):
         self.related_index = index
         self.update_diagram()
         if index is not None:
-            table = self.navigation.base_table(self.controller.visit.query.statement)
+            table = self.navigation.base_table(self.controller.visit.query)
             self.related_content = RelatedContent(self.sections, self.links[index], table, self.open_button)
             self.related_content.pack(fill="both", expand=True, pady=(8, 0))
             self.load_primary_key(self.related_content)

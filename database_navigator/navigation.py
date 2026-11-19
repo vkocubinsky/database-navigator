@@ -123,6 +123,7 @@ class Query:
     text: str
     statement: str
     parameters: tuple = ()
+    table_ref: TableRef | None = None
 
 
 def validate_limit(limit):
@@ -207,7 +208,8 @@ def related_query(table, columns, values, limit, placeholder, projection='*', or
             (*values, limit))
 
 
-def navigation_query(table, columns, values, limit, placeholder, literal, projection='*', order=''):
+def navigation_query(table, columns, values, limit, placeholder, literal, projection='*', order='', *,
+                     table_ref=None):
     validate_limit(limit)
     display = ' and '.join(f'{name} = {literal(value)}' for name, value in zip(columns, values))
     preview = f'select {projection}\nfrom {table}'
@@ -217,7 +219,7 @@ def navigation_query(table, columns, values, limit, placeholder, literal, projec
         preview += '\n' + order.lstrip()
     preview += f'\nlimit {limit};'
     statement, parameters = related_query(table, columns, values, limit, placeholder, projection, order)
-    return Query(preview, statement, parameters)
+    return Query(preview, statement, parameters, table_ref)
 
 
 def selected_sql(selected_columns=None, order_by=(), *, identifier):
@@ -296,7 +298,7 @@ class QueryGenerator:
         return navigation_query(
             self.dialect.sql_table(ref),
             tuple(self.dialect.sql_column(ref, name) for name in names), values,
-            limit, self.dialect.placeholder, self.dialect.sql_literal, projection, ordering)
+            limit, self.dialect.placeholder, self.dialect.sql_literal, projection, ordering, table_ref=ref)
 
 
 class Navigation:
@@ -322,13 +324,18 @@ class Navigation:
         self._metadata.reset()
 
     def base_table(self, statement):
-        """Pure parsing, with no connection or metadata lookup."""
+        """Use the generated destination or infer the base table from editor SQL."""
+        if isinstance(statement, Query):
+            if statement.table_ref is not None:
+                ref = statement.table_ref
+                return self._database_backend.dialect.table_reference(ref.name, ref.schema)
+            statement = statement.statement
         return self._database_backend.base_table(statement)
 
     def initial_child_table(self, query=None):
         if query is None:
             return self._database_backend.dialect.default_schema, ''
-        table = self.base_table(query.statement)
+        table = self.base_table(query)
         return self._database_backend.dialect.split_reference(table)
 
     def table_key(self, schema, table):
@@ -493,7 +500,7 @@ class NavigationSession:
         return self.database_backend.query(*args)
 
     def execute_related_query(self, query, limit):
-        return self.database_backend.execute_related_query(query, limit)
+        return self.query(query.statement, limit, query.parameters)
 
     @property
     def store(self):
@@ -592,8 +599,6 @@ class NavigationSession:
         key = (self.model, ref.schema, ref.name)
         saved = self.store.get_all(*key)
         records = self.store.default_relationships(self.model, ref)
-        if not records:
-            saved.pop('default_direction', None)
         for record in records:
             saved[f'default_{record.direction}_link'] = record
         return key, saved

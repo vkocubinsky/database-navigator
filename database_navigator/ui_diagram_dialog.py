@@ -72,6 +72,9 @@ class DiagramDialog(tk.Toplevel):
         area.rowconfigure(0, weight=1)
         area.columnconfigure(0, weight=1)
         self.canvas.bind('<Configure>', self._resize)
+        self.canvas.tag_bind('relationship', '<Button-1>', self._select_link)
+        self.canvas.tag_bind('relationship', '<Enter>', lambda event: self.canvas.configure(cursor='hand2'))
+        self.canvas.tag_bind('relationship', '<Leave>', lambda event: self.canvas.configure(cursor=''))
         ttk.Button(body, text='Close', command=self.destroy).pack(anchor='e', pady=(8, 0))
         self.message('Loading relationships…')
 
@@ -96,7 +99,7 @@ class DiagramDialog(tk.Toplevel):
         self.selected = selected
         for index in range(len(self.links)):
             color = '#b45309' if index == selected else '#2563a6'
-            self.canvas.itemconfigure(f'link:{index}', fill=color)
+            self.canvas.itemconfigure(f'link:{index}&&!mapping-background', fill=color)
 
     def _resize(self, event):
         if self.master_identity is not None:
@@ -133,11 +136,11 @@ class DiagramDialog(tk.Toplevel):
         return '\n'.join(f'{child} → {parent}' for child, parent in
                          zip(link.relationship.child_key, link.relationship.parent_key, strict=True))
 
-    def _bind_link(self, index):
-        tag = f'link:{index}'
-        self.canvas.tag_bind(tag, '<Button-1>', lambda event: self.select(index))
-        self.canvas.tag_bind(tag, '<Enter>', lambda event: self.canvas.configure(cursor='hand2'))
-        self.canvas.tag_bind(tag, '<Leave>', lambda event: self.canvas.configure(cursor=''))
+    def _select_link(self, event):
+        for tag in self.canvas.gettags('current'):
+            if tag.startswith('link:'):
+                self.select(int(tag.removeprefix('link:')))
+                return
 
     def _card(self, x, y, title, key, *, master=False, minimum_bottom=0):
         top = y
@@ -160,13 +163,13 @@ class DiagramDialog(tk.Toplevel):
     def _label(self, x, y, index):
         """Keep clickable mappings outside cards, with a clear background."""
         tag = f'link:{index}'
-        height = self._text(x, y, self._mapping(index), tags=(tag, 'mapping'))
+        height = self._text(x, y, self._mapping(index), tags=(tag, 'relationship', 'mapping'))
         text = self.canvas.find_withtag('mapping')[-1]
         left, top, right, bottom = self.canvas.bbox(text)
         background = self.canvas.create_rectangle(left - 3, top - 3, right + 3, bottom + 3,
-                                                 fill='#f5f7fb', outline='', tags=('mapping-background',))
+                                                 fill='#f5f7fb', outline='',
+                                                 tags=(tag, 'relationship', 'mapping-background'))
         self.canvas.tag_lower(background, text)
-        self.canvas.tag_bind(background, '<Button-1>', lambda event: self.select(index))
         return height
 
     def draw(self):
@@ -230,11 +233,11 @@ class DiagramDialog(tk.Toplevel):
             tag = f'link:{index}'
             height = self._text(master_x + 310, label_y,
                                 f'Self-reference · {self.links[index].direction}\n{self._mapping(index)}',
-                                tags=(tag,))
+                                tags=(tag, 'relationship'))
             end = label_y + height
             c.create_line(master_x + 270, label_y, master_x + 290, label_y,
                           master_x + 290, end, master_x + 270, end,
-                          arrow='last', width=2, tags=(tag, 'self-loop'))
+                          arrow='last', width=2, tags=(tag, 'relationship', 'self-loop'))
             loop_bottom = end + 12
         master_bottom = self._card(master_x, master_top, f'Master table\n{master_title}', master_key,
                                    master=True, minimum_bottom=loop_bottom)
@@ -246,9 +249,7 @@ class DiagramDialog(tk.Toplevel):
                 coords = ((port_x, master_top, x, y) if parent
                           else (x, y, port_x, master_bottom))
                 edge = c.create_line(*coords, arrow='last', arrowshape=(10, 12, 5),
-                                     width=2, tags=(f'link:{index}', 'edge'))
+                                     width=2, tags=(f'link:{index}', 'relationship', 'edge'))
                 c.tag_lower(edge)
-        for index in range(len(self.links)):
-            self._bind_link(index)
         self.highlight(self.selected)
         c.configure(scrollregion=(0, 0, width, bottom + 30))

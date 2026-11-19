@@ -424,20 +424,8 @@ class PostgreSQLBackend:
         # bind parameters. READ ONLY is additionally enforced by PostgreSQL.
         sql = without_query_terminator(sql)
         bounded = f"SELECT * FROM (\n{sql}\n) AS navigator_result LIMIT {limit}"
-        return self._read_bounded(bounded, limit, parameters)
-
-    def _read_bounded(self, sql, limit, parameters=(), *, prepare=True):
-        """Execute only internally generated or already-wrapped bounded SQL."""
-        validate_limit(limit)
         with read_operation(self.connection):
             with self.connection.cursor() as cursor:
-                cursor.execute(sql, parameters or None, prepare=prepare)
+                cursor.execute(bounded, parameters or None, prepare=True)
                 columns = tuple(item.name for item in cursor.description)
                 return columns, cursor.fetchmany(limit)
-
-    def execute_related_query(self, query, limit):
-        # Generated queries always bind the row limit (and relationship keys),
-        # so psycopg uses single-statement extended protocol without PREPARE.
-        # Execute directly without a separate statement-preparation round trip.
-        return self._read_bounded(query.statement, limit, query.parameters,
-                                  prepare=not bool(query.parameters))

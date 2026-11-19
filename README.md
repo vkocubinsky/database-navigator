@@ -163,7 +163,8 @@ the table list. Saved startup SQL is unchanged.
 
 You can also enter a SELECT query in **Free SQL**, then click **Send**.
 Select a master row and a relationship to see related rows. **Parent** follows the row’s foreign key. **Child** shows rows that refer to it.
-New visits default to **Parent** until a relationship is remembered. **Open table** and **Open row** move
+New visits use the saved direction for the table. Without one, they show **Child**
+if the table has child relationships and **Parent** otherwise. **Open table** and **Open row** move
 related data into the master view; **Back** and **Forward** navigate history.
 
 - Composite foreign keys and relationships across PostgreSQL schemas are supported.

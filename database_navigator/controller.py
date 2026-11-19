@@ -69,7 +69,7 @@ class NavigationController:
             previous = self.visit.query if self.visit else None
             # An unchanged generated query retains bound values on Send.
             query = previous if previous and previous.text == text else Query(text, text)
-        self.navigation.base_table(query.statement)
+        self.navigation.base_table(query)
         return query
 
     def add_visit(self, query, limit):
@@ -153,12 +153,16 @@ class NavigationController:
     def load_visit(self, visit, *, rows_ready, links_ready, defaults_ready,
                    query_failed, metadata_failed, status):
         current = self._navigation_current(lambda: True, selection=False)
-        table = self.navigation.base_table(visit.query.statement)
+        table = self.navigation.base_table(visit.query)
 
         def metadata_ready(links):
             visit.links = links
-            if self.navigation.model and not visit.defaults_applied:
-                saved = (visit.defaults or {}).get(f'default_{visit.direction.lower()}_link')
+            if not visit.defaults_applied:
+                defaults = visit.defaults or {}
+                if defaults.get('default_direction') not in ('parent', 'child'):
+                    visit.direction = 'Child' if any(link.direction == 'child' for link in links) else 'Parent'
+                    defaults_ready(visit.direction)
+                saved = defaults.get(f'default_{visit.direction.lower()}_link')
                 index = default_link_index(links, saved)
                 visit.related_index = index if index is not None else 0
                 visit.defaults_applied = True
@@ -189,9 +193,10 @@ class NavigationController:
             shared = self.state.defaults.setdefault(key, NavigationDefaults(saved))
             shared.refresh(saved)
             visit.defaults = shared
-            direction = saved.get('default_direction')
-            visit.direction = 'Child' if direction == 'child' else 'Parent'
-            defaults_ready(visit.direction)
+            direction = shared.get('default_direction')
+            if direction in ('parent', 'child'):
+                visit.direction = direction.title()
+                defaults_ready(visit.direction)
             discover()
 
         def loaded_rows(result):
@@ -236,7 +241,7 @@ class NavigationController:
             defaults.complete(token, succeeded=False)
             failed(exc)
 
-        table = self.navigation.base_table(visit.query.statement)
+        table = self.navigation.base_table(visit.query)
         self.queue_ordered(self.navigation.save_navigation_default, (table, direction, link), completed, error)
 
     def load_related(self, link, row, limit, *, prepared, completed, failed, current):

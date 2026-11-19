@@ -28,6 +28,8 @@ class ColumnsDialog(tk.Toplevel):
         super().__init__(parent)
         self.apply_callback = apply
         self.columns = columns
+        saved = tuple(name for name in selected or () if name in columns)
+        self.selection_order = saved + tuple(name for name in columns if name not in saved)
         self.saving = False
         self.title(f'Columns — {link.display_table}')
         self.transient(parent.winfo_toplevel())
@@ -119,7 +121,7 @@ class ColumnsDialog(tk.Toplevel):
             return
         choices = None
         if self.mode.get() == 'choose':
-            choices = tuple(name for name, variable in self.column_vars.items() if variable.get())
+            choices = tuple(name for name in self.selection_order if self.column_vars[name].get())
             if not choices:
                 self.error.set('Choose at least one column.')
                 return

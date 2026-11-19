@@ -22,10 +22,8 @@ connection or its credentials to application code.
 """
 
 from pathlib import Path
-from typing import Protocol, runtime_checkable, TYPE_CHECKING
+from typing import Protocol, runtime_checkable
 
-if TYPE_CHECKING:
-    from .navigation import Query
 from .metadata_models import Table, TableDetails, TableRef, TableSummary
 
 
@@ -139,7 +137,6 @@ class DatabaseBackend(Protocol):
 
     The application uses resolve(), table(), and details() for metadata and
     query() for SQL execution.
-    execute_related_query() executes bound Query values prepared by navigation.
     Connections open lazily on the first database operation. Each worker owns
     a separate session; database operations and close() run on that worker.
     """
@@ -238,15 +235,5 @@ class DatabaseBackend(Protocol):
         Limit must be an integer from 1 to 10000, excluding bool. The adapter
         enforces read-only execution, bounded results, and execution timeouts.
         Invalid input or database failures raise exceptions to the caller.
-        """
-        ...
-
-    def execute_related_query(self, query: Query, limit: int) -> tuple[tuple[str, ...], list[tuple]]:
-        """Execute an internally generated navigation query on the owning worker.
-
-        Uses Query.statement and Query.parameters, never the display text.
-        Returns the same (column_names, rows) shape as query(), fetching at most
-        limit rows (1..10000). PostgreSQL executes the generated bounded SQL
-        directly; user-entered SQL must go through query() and its validation.
         """
         ...
