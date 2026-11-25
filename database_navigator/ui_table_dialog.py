@@ -86,6 +86,11 @@ class TableDialog(tk.Toplevel):
         self.grab_set()
         self.after_idle(self.entry.focus_set)
 
+    def current_request(self):
+        """Return a predicate that expires when this catalog is reloaded or closed."""
+        revision = self.revision
+        return lambda: revision == self.revision and bool(self.winfo_exists())
+
     def reload(self):
         self.revision += 1
         self.loading = True

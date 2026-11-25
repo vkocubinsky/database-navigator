@@ -79,36 +79,3 @@ class MetadataCache:
             if generation == self._generation:
                 self._tables[key] = details.table
         return details
-
-    def navigation_links(self, session, table, generation):
-        from .navigation import navigation_links
-
-        ref = self.resolve_table(session, table, generation)
-        details = self.details(session, ref, generation)
-        return navigation_links(details, show_schema=session.dialect.supports_schemas)
-
-    def relationship_diagram(self, session, table, generation):
-        """Read tables for direct endpoints only, never their relationships."""
-        ref = self.resolve_table(session, table, generation)
-        links = self.navigation_links(session, table, generation)
-        master = self._key(session, ref)
-        endpoints = {master: ref}
-        participants = {master: []}
-        for link in links:
-            key = self._key(session, link.ref)
-            endpoints.setdefault(key, link.ref)
-            participants.setdefault(key, []).extend(link.columns)
-            participants[master].extend(link.selected_columns)
-        columns = {}
-        for key, endpoint in endpoints.items():
-            primary = self.table(session, endpoint, generation).primary_key
-            identity = session.dialect.identifier_key
-            primary_names = {identity(column) for column in primary}
-            seen, selected = set(), []
-            for column in (*primary, *participants[key]):
-                name = identity(column)
-                if name not in seen:
-                    selected.append((column, name in primary_names))
-                    seen.add(name)
-            columns[(key.schema, key.name)] = tuple(selected)
-        return (ref.schema, ref.name), links, columns

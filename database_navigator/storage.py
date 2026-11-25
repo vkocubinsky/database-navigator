@@ -261,6 +261,32 @@ class ApplicationStore:
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', ((*key, row.column_name, row.direction, row.position) for row in rows))
 
+    def selected_columns(self, model: str, table: TableRef) -> tuple[str, ...]:
+        """Return the projection in saved order, checking the stored positions."""
+        key = model, table.schema, table.name
+        rows = self._selection_rows(key, self.columns(model, table), StoredColumn)
+        return tuple(row.column_name for row in rows)
+
+    def set_selected_columns(self, model, table, names):
+        if isinstance(names, str):
+            raise ValueError('Supply a sequence of column names.')
+        rows = tuple(StoredColumn(model, table.schema, table.name, name, i)
+                     for i, name in enumerate(names))
+        self.replace_columns(model, table, rows)
+
+    def sort_order(self, model: str, table: TableRef) -> tuple[tuple[str, str], ...]:
+        """Return (column, direction) pairs in saved priority order."""
+        key = model, table.schema, table.name
+        rows = self._selection_rows(key, self.order(model, table), StoredOrder)
+        return tuple((row.column_name, row.direction) for row in rows)
+
+    def set_sort_order(self, model, table, terms):
+        if isinstance(terms, str):
+            raise ValueError('Supply a sequence of sort terms.')
+        rows = tuple(StoredOrder(model, table.schema, table.name, name, direction, i)
+                     for i, (name, direction) in enumerate(terms))
+        self.replace_order(model, table, rows)
+
     def get(self, model, schema_name, table_name, property_name):
         """Return the stored text, or None when the property is absent."""
         self._text_property(property_name)

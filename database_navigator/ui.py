@@ -54,8 +54,6 @@ class RelatedContent(ttk.Frame):
         super().__init__(parent, padding=8, relief="groove", borderwidth=1)
         self.link = link
         self.loading = False
-        self.revision = 0
-        self.future = None
         self.primary_key = None
         self.primary_key_error = None
         self.grid = None
@@ -73,14 +71,8 @@ class RelatedContent(ttk.Frame):
         self.content = ttk.Frame(self.body)
         self.content.pack(fill="both", expand=True)
 
-    def cancel_read(self):
-        self.revision += 1
-        self.loading = False
-        if self.future is not None:
-            self.future.cancel()
-            self.future = None
-
     def clear(self, message=None):
+        self.loading = False
         self.grid = None
         self.row_selection = None
         self.row_selection_revision += 1
@@ -125,14 +117,15 @@ class Navigator(ttk.Frame):
         super().__init__(root, padding=12)
         self.navigation = navigation
         self.state = BrowsingState()
-        self.controller = NavigationController(navigation, self.state)
+        self.controller = NavigationController(navigation, self.state,
+                                               before_metadata_reset=self.capture_visit,
+                                               metadata_reset=self.show_reset_metadata)
         self.model = navigation.model
         self.property_dialog = None
         self.table_dialog = None
         self.relationship_dialog = None
         self.help_dialog = None
         self.diagram_dialog = None
-        self._property_request = 0
         self._links_ready = False
         self._relationship_error = None
         self.related_content = None
@@ -327,14 +320,14 @@ class Navigator(ttk.Frame):
         self._poll_id = self.after(40, self._poll)
         if self.model:
             self._set_stage(f'Loading startup SQL for {self.model}…')
-            self.controller.queue_ordered(self.navigation.startup_sql, (), self.startup_sql_ready, self.startup_sql_failed)
+            self.controller.load_startup_sql(completed=self.startup_sql_ready, failed=self.startup_sql_failed)
         self.editor.focus_set()
 
     def show_diagram(self):
         if not self._links_ready:
             return
         if self.diagram_dialog is None or not self.diagram_dialog.winfo_exists():
-            self.diagram_dialog = DiagramDialog(self, self.select_diagram_link, self.navigation.table_key)
+            self.diagram_dialog = DiagramDialog(self, self.select_diagram_link, self.controller.diagram_table_key)
         self.diagram_dialog.lift()
         self.update_diagram()
 
@@ -354,20 +347,13 @@ class Navigator(ttk.Frame):
             return
         dialog.snapshot = snapshot
         dialog.message('Loading relationships…')
-        table = self.navigation.base_table(self.controller.visit.query)
-
-        def current():
-            return (not self.controller.closed and bool(dialog.winfo_exists())
-                    and dialog.snapshot is snapshot and self._links_ready)
 
         def failed(exc):
             dialog.snapshot = None
             dialog.message(f'Could not load diagram: {exc}')
 
-        self.controller.submit(
-            self.navigation.relationship_diagram, (table,),
-            lambda result: dialog.show(*result, self.related_index),
-            failed, current)
+        self.controller.load_diagram(completed=lambda result: dialog.show(*result, self.related_index),
+                                     failed=failed, current=dialog.winfo_exists)
 
     def select_diagram_link(self, index):
         if not self._links_ready or not 0 <= index < len(self.links):
@@ -523,11 +509,11 @@ class Navigator(ttk.Frame):
 
     def startup_sql_ready(self, text):
         if (self._editor_revision == 0 and not self.editor.edit_modified()
-                and self.state.history_index < 0 and not self.editor.get('1.0', 'end-1c')):
+                and self.controller.visit is None and not self.editor.get('1.0', 'end-1c')):
             self.editor.insert('1.0', text)
             self.editor.edit_reset()
         self.save_startup_button.configure(state='normal')
-        if self.state.history_index < 0:
+        if self.controller.visit is None:
             self._set_stage('Ready. Press Send to execute the query.')
 
     def startup_sql_failed(self, error):
@@ -551,7 +537,7 @@ class Navigator(ttk.Frame):
             self.save_startup_button.configure(state='normal')
             self._set_stage(f'Could not save startup SQL: {error}')
 
-        self.controller.queue_ordered(self.navigation.save_startup_sql, (text,), completed, failed)
+        self.controller.save_startup_sql(text, completed=completed, failed=failed)
 
     def initialize_main_split(self, event):
         # Pane weights govern resizing, but initial widths otherwise come from
@@ -624,8 +610,8 @@ class Navigator(ttk.Frame):
         self.columns_button.configure(state='disabled')
         self.order_button.configure(state='disabled')
         if self.related_content is not None:
-            self.related_content.cancel_read()
-        self.related_content = None
+            self.related_content = None
+            self.controller.change_selection()
         for widget in self.sections.winfo_children():
             widget.destroy()
 
@@ -658,29 +644,38 @@ class Navigator(ttk.Frame):
         self.activate_visit(self.controller.move_history(offset))
         self.results.focus_set()
 
+    def _before_open(self, limit):
+        self.editor_modified()
+        editor_revision = self._editor_revision
+
+        def check_and_capture():
+            if self._editor_revision != editor_revision or self.editor.edit_modified():
+                raise ValueError('Open cancelled because Free SQL changed. Choose Open to try again.')
+            if self.row_limit() != limit:
+                raise ValueError('Row limit changed. Choose Open to try again.')
+            self.capture_visit()
+
+        return check_and_capture
+
+    def _show_opened_visit(self, visit):
+        self.activate_visit(visit)
+        self.results.focus_set()
+
     def open_related(self, section):
         selected = self.results.selected_index()
         if section is None or selected is None or not self.rows:
             self._set_stage("Select a row before opening a related table.")
             return
         try:
-            args = (section.link, self.results.selected_row(), self.row_limit())
+            row = self.results.selected_row()
+            limit = self.row_limit()
         except ValueError as exc:
             self._set_stage(f"Error: {exc}")
             return
-        self.editor_modified()
-        editor_revision = self._editor_revision
-        current = lambda: section is self.related_content
-
-        def prepared(query):
-            if self._editor_revision != editor_revision or self.editor.edit_modified():
-                self._set_stage('Open table cancelled because Free SQL changed.')
-                return
-            self.send(navigation=query)
-
         self._set_stage(f'Preparing {section.link.display_table}…')
-        self.controller.open_related(*args, prepared=prepared,
-                                     failed=lambda exc: self._set_stage(f'Error: {exc}'), current=current)
+        self.controller.open_link(section.link, row, limit, current=lambda: section is self.related_content,
+                                  before_open=self._before_open(limit), opened=self._show_opened_visit,
+                                  failed=lambda exc: self._set_stage(f'Error: {exc}'))
 
     def update_open_row(self, event=None):
         section = self.related_content
@@ -701,7 +696,7 @@ class Navigator(ttk.Frame):
             reason = 'Select a related row to open it.'
         else:
             try:
-                self.navigation.validate_row_key(section.primary_key, section.grid.selected_row())
+                self.controller.validate_row_key(section.primary_key, section.grid.selected_row())
             except ValueError as exc:
                 reason = str(exc)
             else:
@@ -729,27 +724,19 @@ class Navigator(ttk.Frame):
             return
         selected = section.grid.selected_index()
         try:
-            args = (section.link, section.grid.selected_row(), self.row_limit())
+            row = section.grid.selected_row()
+            limit = self.row_limit()
         except ValueError as exc:
             self._set_stage(f'Error: {exc}')
             return
-        revision = section.revision
         row_revision = section.row_selection_revision
-        self.editor_modified()
-        editor_revision = self._editor_revision
-        current = lambda: (section is self.related_content and revision == section.revision
-                           and row_revision == section.row_selection_revision
+        current = lambda: (section is self.related_content and row_revision == section.row_selection_revision
                            and section.grid is not None and section.grid.selected_index() == selected)
 
-        def prepared(query):
-            if self._editor_revision != editor_revision or self.editor.edit_modified():
-                self._set_stage('Open row cancelled because Free SQL changed.')
-                return
-            self.send(navigation=query)
-
         self._set_stage(f'Preparing selected row from {section.link.display_table}…')
-        self.controller.open_row(*args, prepared=prepared,
-                                 failed=lambda exc: self._set_stage(f'Error: {exc}'), current=current)
+        self.controller.open_link(section.link, row, limit, by_primary_key=True, current=current,
+                                  before_open=self._before_open(limit), opened=self._show_opened_visit,
+                                  failed=lambda exc: self._set_stage(f'Error: {exc}'))
 
     def choose_table(self):
         if self.table_dialog is not None and self.table_dialog.winfo_exists():
@@ -757,10 +744,8 @@ class Navigator(ttk.Frame):
             return
 
         def load(dialog):
-            revision = dialog.revision
-            # Dialog reads survive navigation changes and follow pending preference saves.
-            self.controller.queue_ordered(self.navigation.list_tables, (), dialog.loaded, dialog.load_failed,
-                lambda: not self.controller.closed and bool(dialog.winfo_exists()) and revision == dialog.revision)
+            self.controller.list_tables(completed=dialog.loaded, failed=dialog.load_failed,
+                                        current=dialog.current_request())
 
         self.table_dialog = TableDialog(self, load, self.open_chosen_table)
 
@@ -770,32 +755,13 @@ class Navigator(ttk.Frame):
         except ValueError as exc:
             dialog.open_failed(exc)
             return
-        self.editor_modified()
-        editor_revision = self._editor_revision
-        request_revision = self.state.request_revision
-        self.state.open_revision += 1
-        open_revision = self.state.open_revision
-        revision = dialog.revision
 
-        def prepared(query):
-            if self._editor_revision != editor_revision or self.editor.edit_modified():
-                dialog.open_failed('Open cancelled because Free SQL changed. Choose Open to try again.')
-                return
-            if request_revision != self.state.request_revision or open_revision != self.state.open_revision:
-                dialog.open_failed('Open cancelled because navigation changed. Choose Open to try again.')
-                return
-            try:
-                if limit != self.row_limit():
-                    raise ValueError('Row limit changed. Choose Open to try again.')
-                self.controller.query_for_text('', query)
-            except ValueError as exc:
-                dialog.open_failed(exc)
-                return
+        def opened(visit):
             dialog.destroy()
-            self.send(navigation=query)
+            self._show_opened_visit(visit)
 
-        self.controller.queue_ordered(self.navigation.table_query, (ref, limit), prepared, dialog.open_failed,
-            lambda: not self.controller.closed and bool(dialog.winfo_exists()) and revision == dialog.revision)
+        self.controller.open_table(ref, limit, current=dialog.current_request(), before_open=self._before_open(limit),
+                                   opened=opened, failed=dialog.open_failed)
 
     def manage_relationships(self):
         if not self.model:
@@ -803,16 +769,7 @@ class Navigator(ttk.Frame):
         if self.relationship_dialog is not None and self.relationship_dialog.winfo_exists():
             self.relationship_dialog.lift()
             return
-        visit = self.controller.visit
-        child_table = self.navigation.initial_child_table(visit.query if visit else None)
-
-        def request(dialog, operation, args, completed, failed):
-            # Use the ordered local-storage queue so navigation never cancels a save.
-            self.controller.queue_ordered(operation, args, completed, failed,
-                                lambda: not self.controller.closed and bool(dialog.winfo_exists()))
-
-        self.relationship_dialog = RelationshipDialog(
-            self, self.model, child_table, self.navigation, request, self.reset_metadata)
+        self.relationship_dialog = RelationshipDialog(self, self.controller.relationship_editor())
 
     def edit_property(self, property_name):
         section = self.related_content
@@ -821,32 +778,19 @@ class Navigator(ttk.Frame):
         if self.property_dialog is not None and self.property_dialog.winfo_exists():
             self.property_dialog.lift()
             return
-        self._property_request += 1
-        token = self._property_request
-        current = lambda: (not self.controller.closed and token == self._property_request
-                           and section is self.related_content)
+        editor = self.controller.table_preference_editor(
+            section.link, property_name, current=lambda: section is self.related_content, refresh=self.select_row)
         self._set_stage(f'Loading columns for {section.link.display_table}…')
 
-        def ready(result):
-            columns, saved = result
+        def ready(columns, selected, error):
             self.related_status()
             dialog_type = {'columns': ColumnsDialog, 'order_by': OrderDialog}[property_name]
-            self.property_dialog = dialog_type(
-                self, section.link, columns, saved.get(property_name), save,
-                error=saved.get(f'{property_name}_error', ''))
+            self.property_dialog = dialog_type(self, section.link, columns, selected, save, error=error)
 
         def save(dialog, choices):
-            def completed(_):
-                dialog.destroy()
-                # Refresh only this selection; never rewrite free SQL or main results.
-                if section is self.related_content:
-                    self.select_row()
-            self.controller.queue_ordered(self.navigation.save_preference, (section.link, property_name, choices),
-                         completed, dialog.failed,
-                         lambda: not self.controller.closed and bool(dialog.winfo_exists()))
+            editor.save(choices, completed=dialog.destroy, failed=dialog.failed, current=dialog.winfo_exists)
 
-        self.controller.submit(self.navigation.table_preferences, (section.link,), ready,
-                     lambda exc: self._set_stage(f'Error: {exc}'), current)
+        editor.load(completed=ready, failed=lambda exc: self._set_stage(f'Error: {exc}'))
 
     def send_from_button(self):
         self.editor.focus_set()
@@ -867,9 +811,9 @@ class Navigator(ttk.Frame):
         return "break"
 
     def reset_metadata(self):
-        self.capture_visit()
         self.controller.reset_metadata()
-        visit = self.controller.visit
+
+    def show_reset_metadata(self, visit):
         if visit is not None and visit.rows is not None:
             # Reuse main rows and preserve unsent editor changes.
             text = self.editor.get("1.0", "end-1c")
@@ -899,7 +843,7 @@ class Navigator(ttk.Frame):
             self.editor.insert("1.0", visit.query.text)
         self.limit.set(str(visit.limit))
         self.history_buttons()
-        table = self.navigation.base_table(visit.query)
+        table = self.controller.current_table
         self.editor_modified()
         editor_revision, focus_revision = self._editor_revision, self._editor_focus_revision
 
@@ -975,14 +919,12 @@ class Navigator(ttk.Frame):
             self.open_row_button.configure(state='disabled')
             selected = bool(self.results.selected_index() is not None and self.rows)
             section.open_button.configure(state="normal" if selected else "disabled")
-            section.cancel_read()
-            section.clear()
             self.load_related(section)
         self.related_status(reset_timer=True)
 
     def populate_related(self):
         self.related_list.delete(*self.related_list.get_children())
-        table = self.navigation.base_table(self.controller.visit.query)
+        table = self.controller.current_table
         for index in self.controller.visible_links(
                 self.links, self.related_search.get(), self.related_direction.get()):
             self.related_list.insert("", "end", iid=str(index), values=(self.links[index].notation(table),))
@@ -1044,7 +986,7 @@ class Navigator(ttk.Frame):
         self.related_index = index
         self.update_diagram()
         if index is not None:
-            table = self.navigation.base_table(self.controller.visit.query)
+            table = self.controller.current_table
             self.related_content = RelatedContent(self.sections, self.links[index], table, self.open_button)
             self.related_content.pack(fill="both", expand=True, pady=(8, 0))
             self.load_primary_key(self.related_content)
@@ -1089,16 +1031,11 @@ class Navigator(ttk.Frame):
             section.clear(str(exc))
             self.update_open_row()
             return
-        revision = section.revision
-        current = lambda: (section is self.related_content
-                           and revision == section.revision)
         section.clear("Loading…")
         section.loading = True
         self.update_open_row()
 
         def complete(result=None, error=None):
-            section.loading = False
-            section.future = None
             if error is not None:
                 section.clear(str(error))
             else:
@@ -1109,10 +1046,10 @@ class Navigator(ttk.Frame):
             self.update_open_row()
             self.related_status()
 
-        section.future = self.controller.load_related(
+        self.controller.load_related(
             section.link, row, limit,
             prepared=lambda query: self.show_generated_sql(query, section.link.display_table),
-            completed=complete, failed=lambda exc: complete(error=exc), current=current)
+            completed=complete, failed=lambda exc: complete(error=exc), current=lambda: section is self.related_content)
 
 
 def main():

@@ -96,6 +96,14 @@ class DatabaseDialect(Protocol):
         """
         ...
 
+    def reference_from_sql(self, token: str) -> str:
+        """Convert one SQL table identifier to a lookup reference, without I/O.
+
+        SQLite requires an unqualified name. PostgreSQL folds unquoted names
+        and accepts a schema qualifier subject to its generated-identifier rules.
+        """
+        ...
+
     def split_reference(self, reference: str) -> tuple[str | None, str]:
         """Split a reference into (schema, table) without resolving it.
 
@@ -171,16 +179,6 @@ class DatabaseBackend(Protocol):
         SQLite raises ValueError for the same file, including symlink/hardlink
         aliases. PostgreSQL needs no file check. Does not open a connection or
         create the application database; filesystem checks may occur.
-        """
-        ...
-
-    def base_table(self, query: str) -> str:
-        """Extract a table-name string from SQL, without looking up the table.
-
-        Uses a '-- derived: table_name' comment when supplied, otherwise a
-        simple first-FROM heuristic. This is not a full SQL parser. Raises
-        ValueError if no usable reference can be extracted. Pass the result
-        to resolve() to obtain a resolved TableRef.
         """
         ...
 

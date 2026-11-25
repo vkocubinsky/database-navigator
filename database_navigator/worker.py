@@ -21,18 +21,14 @@ from concurrent.futures import Future
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
 
-from .metadata_cache import MetadataCache
-from .metadata_models import TableRef
-
 
 __all__ = ["DatabasePool", "PendingTasks"]
 
 
 class DatabasePool:
-    def __init__(self, session_factory, max_workers=4, *, metadata=None):
+    def __init__(self, session_factory, max_workers=4):
         if not isinstance(max_workers, int) or isinstance(max_workers, bool) or max_workers < 1:
             raise ValueError("Worker count must be a positive integer.")
-        self.metadata = metadata if metadata is not None else MetadataCache()
         self.session_factory = session_factory
         self.jobs = Queue()
         self.stopping = Event()
@@ -42,13 +38,14 @@ class DatabasePool:
         for thread in self.threads:
             thread.start()
 
-    def submit(self, method, *args):
+    def submit(self, operation, *args):
+        """Run a named session method or a callable taking (session, *args)."""
         future = Future()
         with self._lock:
             if self.stopping.is_set():
                 future.cancel()
             else:
-                self.jobs.put((future, method, args, self.metadata.generation))
+                self.jobs.put((future, operation, args))
         return future
 
     def close(self):
@@ -59,7 +56,7 @@ class DatabasePool:
             self.stopping.set()
             while True:
                 try:
-                    future, _, _, _ = self.jobs.get_nowait()
+                    future, _, _ = self.jobs.get_nowait()
                 except Empty:
                     break
                 cancelled.append(future)
@@ -76,7 +73,7 @@ class DatabasePool:
                 job = self.jobs.get()
                 if job is None:
                     break
-                future, method, args, generation = job
+                future, operation, args = job
                 with self._lock:
                     stopping = self.stopping.is_set()
                     running = not stopping and future.set_running_or_notify_cancel()
@@ -87,19 +84,10 @@ class DatabasePool:
                 try:
                     if session is None:
                         session = self.session_factory()
-                    if method == "navigation_links":
-                        result = self.metadata.navigation_links(session, *args, generation)
-                    elif method in ('list_tables', 'table', 'details'):
-                        result = getattr(self.metadata, method)(session, *args, generation)
-                    elif method == 'primary_key':
-                        table, schema = args
-                        ref = (TableRef(schema, table) if schema else
-                               self.metadata.resolve_table(session, table, generation))
-                        result = self.metadata.table(session, ref, generation).primary_key
-                    elif method == 'relationship_diagram':
-                        result = self.metadata.relationship_diagram(session, *args, generation)
+                    if isinstance(operation, str):
+                        result = getattr(session, operation)(*args)
                     else:
-                        result = getattr(session, method)(*args)
+                        result = operation(session, *args)
                     future.set_result(result)
                 except Exception as exc:
                     future.set_exception(exc)
@@ -126,6 +114,12 @@ class PendingTasks:
         future = operation(*args)
         self.pending.append((future, completed, failed, current))
         return future
+
+    def cancel_reads(self, *, stale_only=False):
+        """Cancel pending reads where possible. Ordered operations have their own lifetime."""
+        for future, _, _, current in self.pending:
+            if not stale_only or not current():
+                future.cancel()
 
     def queue_ordered(self, operation, args, completed, failed, current=lambda: True):
         # Saves outlive navigation. New defaults reads must follow earlier saves.
@@ -170,8 +164,7 @@ class PendingTasks:
         if self.closed:
             return
         self.closed = True
-        for future, *_ in self.pending:
-            future.cancel()
+        self.cancel_reads()
         self.pending.clear()
         self._ordered_jobs.clear()
         if self._ordered_job is not None:

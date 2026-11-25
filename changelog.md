@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.0
+
+- **Open table** and **Open row** cancel a pending open if you change the row
+  limit while the query is being prepared. Retry to use the new limit in both
+  the SQL and the history entry.
+- **Choose columns…** and **Set sort order…** wait for earlier saves before
+  showing the current choices. If a saved column list or sort order contains
+  a gap in its positions, the editor reports it and lets you reset or replace
+  that setting.
+- **Manage relationships** loads both tables' column lists together. Saving or
+  deleting a relationship refreshes the current visit even if the dialog has
+  closed.
+- Python callers of `QueryGenerator` now pass column names in display order
+  and `(column, direction)` pairs in sort order. The existing application
+  database works with this release.
+- Custom Python database dialects now implement `reference_from_sql(token)`.
+  For catalog reads, diagrams, and metadata resets, use `Navigation`.
+  Direct `DatabasePool` callers now supply a session factory and an optional
+  worker count. To embed the relationship editor, use
+  `RelationshipDialog(parent, controller.relationship_editor())`.
+
 ## 0.6.0
 
 - New visits use the table’s saved direction, even when no relationship was

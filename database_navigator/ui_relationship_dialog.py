@@ -31,19 +31,16 @@ def notation(key):
 
 
 class RelationshipDialog(tk.Toplevel):
-    def __init__(self, parent, model, child, navigation, request, changed):
+    def __init__(self, parent, controller):
         super().__init__(parent)
-        self.request = request
-        self.changed = changed
-        self.child = child
-        self.navigation = navigation
+        self.controller = controller
         self.records = {}
         self.identifier = None
         self.busy = False
         self.loaded = False
         self.columns = ((), ())
         self.controls = []
-        self.title(f'Custom relationships — {model}')
+        self.title(f'Custom relationships — {controller.model}')
         self.transient(parent.winfo_toplevel())
         self.geometry('880x680')
         self.minsize(720, 600)
@@ -51,7 +48,7 @@ class RelationshipDialog(tk.Toplevel):
         self.bind('<Escape>', lambda event: self.cancel())
         body = ttk.Frame(self, padding=12)
         body.pack(fill='both', expand=True)
-        ttk.Label(body, text=f'Custom relationships for model: {model}',
+        ttk.Label(body, text=f'Custom relationships for model: {controller.model}',
                   font=('TkDefaultFont', 12, 'bold')).pack(anchor='w')
         ttk.Label(body, text='Stored locally and used in both directions. Database foreign keys are unchanged.'
                   ).pack(anchor='w', pady=(4, 8))
@@ -92,7 +89,7 @@ class RelationshipDialog(tk.Toplevel):
         load_bar = ttk.Frame(editor)
         load_bar.pack(fill='x')
         self.button(load_bar, 'Load columns', self.load_columns)
-        ttk.Label(load_bar, text=('Blank schema uses the connection search path.' if navigation.supports_schemas else
+        ttk.Label(load_bar, text=('Blank schema uses the connection search path.' if controller.supports_schemas else
                                  'Use schema main. Enter table names without SQL quotes.')
                   ).pack(side='left', padx=6)
         self.pairs = self.tree(editor, ('child', 'parent'), ('Child column', 'Parent column'), 4)
@@ -164,7 +161,7 @@ class RelationshipDialog(tk.Toplevel):
             self.error.set('')
             self.update_controls()
             completed(result)
-        self.request(self, operation, args, ready, self.failed)
+        operation(*args, completed=ready, failed=self.failed, current=self.winfo_exists)
 
     def failed(self, error):
         self.busy = False
@@ -183,7 +180,7 @@ class RelationshipDialog(tk.Toplevel):
                 self.relationships.selection_set(str(selected))
                 self.relationships.see(str(selected))
             self.update_controls()
-        self.run(self.navigation.custom_relationships, (), ready, 'Loading custom relationships…')
+        self.run(self.controller.list_relationships, (), ready, 'Loading custom relationships…')
 
     def invalidate_columns(self, *args):
         self.loaded = False
@@ -196,9 +193,10 @@ class RelationshipDialog(tk.Toplevel):
             return
         self.identifier = None
         self.editor_title.set('New relationship')
-        self.endpoints[0][0].set(self.child[0] or '')
-        self.endpoints[0][1].set(self.child[1])
-        self.endpoints[1][0].set(self.child[0] or ('' if self.navigation.supports_schemas else 'main'))
+        schema, table = self.controller.child
+        self.endpoints[0][0].set(schema or '')
+        self.endpoints[0][1].set(table)
+        self.endpoints[1][0].set(schema or ('' if self.controller.supports_schemas else 'main'))
         self.endpoints[1][1].set('')
         self.pairs.delete(*self.pairs.get_children())
         for variable in self.column_vars:
@@ -230,20 +228,18 @@ class RelationshipDialog(tk.Toplevel):
             self.error.set('Enter both table names first.')
             return
         self.loaded = False
-        def child_ready(child):
-            def parent_ready(parent):
-                for variables, endpoint in zip(self.endpoints, (child, parent)):
-                    for variable, value in zip(variables, endpoint[:2]):
-                        variable.set(value)
-                self.columns = (child[2], parent[2])
-                for combo, variable, columns in zip(self.combos, self.column_vars, self.columns):
-                    combo.configure(values=columns)
-                    variable.set(columns[0] if columns else '')
-                self.loaded = True
-                self.update_controls()
-                self.error.set('Choose column pairs in order, then save.')
-            self.run(self.navigation.relationship_columns, endpoints[1], parent_ready, 'Loading parent columns…')
-        self.run(self.navigation.relationship_columns, endpoints[0], child_ready, 'Loading child columns…')
+        def ready(resolved):
+            for variables, (schema, table, _) in zip(self.endpoints, resolved):
+                variables[0].set(schema)
+                variables[1].set(table)
+            self.columns = tuple(columns for _, _, columns in resolved)
+            for combo, variable, columns in zip(self.combos, self.column_vars, self.columns):
+                combo.configure(values=columns)
+                variable.set(columns[0] if columns else '')
+            self.loaded = True
+            self.update_controls()
+            self.error.set('Choose column pairs in order, then save.')
+        self.run(self.controller.load_columns, endpoints, ready, 'Loading relationship columns…')
 
     def select_pair(self, event=None):
         if self.busy:
@@ -314,9 +310,8 @@ class RelationshipDialog(tk.Toplevel):
         def saved(record):
             self.identifier = record.id
             self.editor_title.set('Editing custom relationship')
-            self.changed()
             self.reload(record.id)
-        self.run(self.navigation.save_custom_relationship, (self.identifier, key),
+        self.run(self.controller.save, (self.identifier, key),
                  saved, 'Validating and saving relationship…')
 
     def delete(self):
@@ -331,9 +326,8 @@ class RelationshipDialog(tk.Toplevel):
         def deleted(_):
             if self.identifier == identifier:
                 self.new()
-            self.changed()
             self.reload()
-        self.run(self.navigation.delete_custom_relationship, (identifier,), deleted, 'Deleting custom relationship…')
+        self.run(self.controller.delete, (identifier,), deleted, 'Deleting custom relationship…')
 
     def cancel(self):
         if not self.busy:

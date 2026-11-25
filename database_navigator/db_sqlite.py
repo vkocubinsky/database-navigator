@@ -26,7 +26,7 @@ import time
 
 from .contracts import TableNotFoundError
 from .metadata_models import Column, Relationship, Table, TableDetails, TableRef, TableSummary
-from .navigation import (derived_reference, primary_key_values, validate_limit)
+from .query import base_table_for_query, parse_table, primary_key_values, validate_limit
 
 
 __all__ = [
@@ -69,6 +69,12 @@ class SQLiteDialect:
         self.validate_schema(schema if schema is not None else self.default_schema)
         self.validate_identifier(table)
         # SQLite resolution accepts a literal table name, including dots/quotes.
+        return table
+
+    def reference_from_sql(self, token):
+        schema, table = parse_table(token)
+        if schema is not None:
+            raise ValueError('Use an unqualified SQLite base-table name.')
         return table
 
     def split_reference(self, reference):
@@ -142,10 +148,7 @@ def sqlite_literal(value):
 
 
 def derived_table(query):
-    schema, table = derived_reference(query)
-    if schema is not None:
-        raise ValueError('Use an unqualified SQLite base-table name; override with -- derived: table_name if needed.')
-    return table
+    return base_table_for_query(query, SQLITE)
 
 
 def sqlite_primary_key(connection: sqlite3.Connection, table: str,
@@ -221,7 +224,7 @@ class SQLiteBackend:
     dialect = SQLITE
 
     def base_table(self, query):
-        return derived_table(query)
+        return base_table_for_query(query, self.dialect)
 
     def __init__(self, connection_string):
         if not connection_string.startswith("sqlite:///"):

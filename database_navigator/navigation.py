@@ -20,13 +20,14 @@ from dataclasses import dataclass, replace
 from fnmatch import fnmatchcase
 from concurrent.futures import Future
 from collections.abc import Mapping, Sequence
-import re
 from typing import Literal
 
 from .metadata_models import Relationship, Table, TableDetails, TableRef, TableSummary
 from .metadata_cache import MetadataCache
+from .query import (Query, base_table_for_query, column_values, derived_reference,
+                    parse_table, primary_key_values, validate_limit)
 from .storage import ApplicationStore, DEFAULT_DATABASE, validate_relationship, validate_application_database
-from .storage_models import NavigationDefault, StoredColumn, StoredOrder, StoredRelationship
+from .storage_models import NavigationDefault, StoredRelationship
 from .worker import DatabasePool
 from .contracts import DatabaseBackend, DatabaseDialect
 
@@ -47,6 +48,7 @@ __all__ = [
     "validate_limit",
     "parse_table",
     "derived_reference",
+    "base_table_for_query",
     "primary_key_values",
 ]
 
@@ -118,75 +120,6 @@ def default_link_index(links, value):
     return next((index for index, link in enumerate(links) if link.selection == value), None)
 
 
-@dataclass(frozen=True)
-class Query:
-    text: str
-    statement: str
-    parameters: tuple = ()
-    table_ref: TableRef | None = None
-
-
-def validate_limit(limit):
-    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 10000:
-        raise ValueError("Row limit must be an integer between 1 and 10000.")
-
-
-_IDENTIFIER = r'(?:"(?:[^"]|"")+"|\w[\w$]*)'
-_TABLE = rf'{_IDENTIFIER}(?:\s*\.\s*{_IDENTIFIER})?'
-
-
-def parse_table(name, *, postgres=False):
-    """Parse SQL notation; only PostgreSQL folds unquoted identifiers."""
-    if not re.fullmatch(_TABLE, name):
-        raise ValueError('Use table or schema.table, with double quotes for special names.')
-    parts = re.findall(_IDENTIFIER, name)
-    parts = [part[1:-1].replace('""', '"') if part.startswith('"')
-             else part.lower() if postgres else part for part in parts]
-    return (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0])
-
-
-def column_values(names, columns, row, identifier_key):
-    values = []
-    for name in names:
-        matches = [i for i, column in enumerate(columns) if identifier_key(column) == identifier_key(name)]
-        if len(matches) != 1:
-            raise ValueError(f"Query must return an unambiguous column named {name!r}.")
-        values.append(row[matches[0]])
-    return tuple(values)
-
-
-def primary_key_values(key, columns, row, identifier_key):
-    if not key:
-        raise ValueError('This table has no declared primary key.')
-    try:
-        values = column_values(key, columns, row, identifier_key)
-    except ValueError as exc:
-        raise ValueError(f'{exc} Include all primary-key columns through Columns.') from None
-    if any(value is None for value in values):
-        raise ValueError('The selected row has a NULL primary-key value.')
-    return values
-
-
-def derived_reference(query, *, postgres=False):
-    """Prefer an explicit override; otherwise infer from the first FROM table.
-
-    This deliberately simple heuristic is not a SQL parser. Complex queries can
-    supply -- derived: table_name. Never insert an annotation or change the SQL.
-    """
-    matches = re.findall(r"^[ \t]*--[ \t]*derived:([^\r\n]*)", query,
-                         re.MULTILINE | re.IGNORECASE)
-    if matches:
-        if len(matches) != 1 or not matches[0].strip():
-            raise ValueError("Use exactly one nonempty -- derived: table_name comment.")
-        reference = matches[0].strip()
-    else:
-        match = re.search(rf'\bfrom\s+({_TABLE})', query, re.IGNORECASE)
-        if match is None:
-            raise ValueError("Cannot determine the base table. Add a -- derived: table_name comment.")
-        reference = match[1]
-    return parse_table(reference, postgres=postgres)
-
-
 def filter_tables(tables, search):
     """Filter catalog summaries by name or schema.name without database I/O."""
     pattern = search.casefold()
@@ -222,19 +155,8 @@ def navigation_query(table, columns, values, limit, placeholder, literal, projec
     return Query(preview, statement, parameters, table_ref)
 
 
-def selected_sql(selected_columns=None, order_by=(), *, identifier):
-    """Compile structured column choices, never raw SQL fragments."""
-    projection = ', '.join(map(identifier, selected_columns)) if selected_columns else '*'
-    terms = []
-    for name, direction in order_by:
-        if direction not in ('ASC', 'DESC'):
-            raise ValueError('Sort direction must be ASC or DESC.')
-        terms.append(f'{identifier(name)} {direction}')
-    return projection, ' order by ' + ', '.join(terms) if terms else ''
-
-
 class QueryGenerator:
-    """Generate bound queries from explicit rows and stored selections; no I/O."""
+    """Generate bound queries from typed row values, column names, and sort terms; no I/O."""
 
     def __init__(self, dialect: DatabaseDialect):
         self.dialect = dialect
@@ -247,29 +169,30 @@ class QueryGenerator:
         return (identity(left.schema), identity(left.name)) == (identity(right.schema), identity(right.name))
 
     def _options(self, ref, columns, order):
-        models = set()
-        for records in (columns, order):
-            names = set()
-            for position, record in enumerate(records):
-                if not self._same_table(ref, TableRef(record.schema_name, record.table_name)):
-                    raise ValueError('Stored selections must belong to the destination table.')
-                if record.position != position:
-                    raise ValueError('Stored selection positions must be contiguous and in order.')
-                name = self.dialect.identifier_key(record.column_name)
-                if name in names:
-                    raise ValueError('Choose each column only once.')
-                names.add(name)
-                models.add(record.model)
-        if len(models) > 1:
-            raise ValueError('Stored selections must belong to the same model.')
-        return selected_sql(
-            tuple(record.column_name for record in columns),
-            tuple((record.column_name, record.direction) for record in order),
-            identifier=lambda name: self.dialect.sql_column(ref, name))
+        if isinstance(columns, str) or isinstance(order, str):
+            raise ValueError('Supply a sequence of column names and a sequence of sort terms.')
+
+        def render(name, seen):
+            sql = self.dialect.sql_column(ref, name)
+            key = self.dialect.identifier_key(name)
+            if key in seen:
+                raise ValueError('Choose each column only once.')
+            seen.add(key)
+            return sql
+
+        projected = set()
+        sorted_names = set()
+        projection = ', '.join(render(name, projected) for name in columns) or '*'
+        terms = []
+        for name, direction in order:
+            if direction not in ('ASC', 'DESC'):
+                raise ValueError('Sort direction must be ASC or DESC.')
+            terms.append(f'{render(name, sorted_names)} {direction}')
+        return projection, ' order by ' + ', '.join(terms) if terms else ''
 
     def query_for_relationship(
         self, table: Table | TableRef, row: Mapping[str, object], link: NavigationLink, *,
-        columns: Sequence[StoredColumn], order: Sequence[StoredOrder], limit: int,
+        columns: Sequence[str], order: Sequence[tuple[str, str]], limit: int,
     ) -> Query:
         source = link.relationship.child_table if link.direction == 'parent' else link.relationship.parent_table
         if not self._same_table(self._ref(table), source):
@@ -280,13 +203,13 @@ class QueryGenerator:
 
     def query_for_table(
         self, table: Table | TableRef, *,
-        columns: Sequence[StoredColumn], order: Sequence[StoredOrder], limit: int,
+        columns: Sequence[str], order: Sequence[tuple[str, str]], limit: int,
     ) -> Query:
         return self._query(self._ref(table), (), (), columns, order, limit)
 
     def query_for_primary_key(
         self, table: Table | TableRef, row: Mapping[str, object], primary_key: tuple[str, ...], *,
-        columns: Sequence[StoredColumn], order: Sequence[StoredOrder], limit: int,
+        columns: Sequence[str], order: Sequence[tuple[str, str]], limit: int,
     ) -> Query:
         ref = self._ref(table)
         values = primary_key_values(primary_key, tuple(row), tuple(row.values()),
@@ -299,6 +222,10 @@ class QueryGenerator:
             self.dialect.sql_table(ref),
             tuple(self.dialect.sql_column(ref, name) for name in names), values,
             limit, self.dialect.placeholder, self.dialect.sql_literal, projection, ordering, table_ref=ref)
+
+
+def _table_key(dialect, schema, table):
+    return dialect.identifier_key(schema or dialect.default_schema), dialect.identifier_key(table)
 
 
 class Navigation:
@@ -314,7 +241,7 @@ class Navigation:
         self._metadata = MetadataCache()
         session_factory = lambda: NavigationSession(
             database_backend.new_session(), model, application_database, metadata=self._metadata)
-        self._pool = DatabasePool(session_factory, metadata=self._metadata)
+        self._pool = DatabasePool(session_factory)
 
     def close(self):
         """Cancel queued work without waiting; workers close their own connections."""
@@ -325,12 +252,7 @@ class Navigation:
 
     def base_table(self, statement):
         """Use the generated destination or infer the base table from editor SQL."""
-        if isinstance(statement, Query):
-            if statement.table_ref is not None:
-                ref = statement.table_ref
-                return self._database_backend.dialect.table_reference(ref.name, ref.schema)
-            statement = statement.statement
-        return self._database_backend.base_table(statement)
+        return base_table_for_query(statement, self._database_backend.dialect)
 
     def initial_child_table(self, query=None):
         if query is None:
@@ -341,8 +263,7 @@ class Navigation:
     def table_key(self, schema, table):
         """Pure identity comparison for diagram nodes, including SQLite casing."""
         dialect = self._database_backend.dialect
-        return (dialect.identifier_key(schema or dialect.default_schema),
-                dialect.identifier_key(table))
+        return _table_key(dialect, schema, table)
 
     def validate_row_key(self, key, row):
         return self._database_backend.dialect.validate_row_key(key, tuple(row), tuple(row.values()))
@@ -352,29 +273,33 @@ class Navigation:
         args = (sql, limit, parameters) if parameters else (sql, limit)
         return self._pool.submit('query', *args)
 
+    def _read_metadata(self, operation, *args):
+        # A request queued before reset may finish, but cannot refill the new cache.
+        return self._pool.submit(operation, *args, self._metadata.generation)
+
     def table(self, ref) -> Future:
-        return self._pool.submit('table', ref)
+        return self._read_metadata(self._metadata.table, ref)
 
     def list_tables(self) -> Future:
         """Return cached catalog summaries, discovered lazily on a worker."""
-        return self._pool.submit('list_tables')
+        return self._read_metadata(self._metadata.list_tables)
 
     def table_query(self, ref: TableRef, limit: int) -> Future:
         return self._pool.submit('table_query', ref, limit)
 
     def details(self, ref) -> Future:
-        return self._pool.submit('details', ref)
+        return self._read_metadata(self._metadata.details, ref)
 
     def navigation_links(self, table) -> Future:
         """Return a future containing parent/child NavigationLink choices."""
-        return self._pool.submit('navigation_links', table)
+        return self._read_metadata('navigation_links', table)
 
     def relationship_diagram(self, table) -> Future:
         """Return master identity, direct links, and key/relationship columns."""
-        return self._pool.submit('relationship_diagram', table)
+        return self._read_metadata('relationship_diagram', table)
 
     def primary_key(self, table, schema=None) -> Future:
-        return self._pool.submit('primary_key', table, schema)
+        return self._read_metadata('primary_key', table, schema)
 
     def navigation_query(self, link, row, limit) -> Future:
         return self._pool.submit('navigation_query', link, row, limit)
@@ -408,6 +333,10 @@ class Navigation:
 
     def relationship_columns(self, schema, table) -> Future:
         return self._pool.submit('relationship_columns', schema, table)
+
+    def relationship_endpoints(self, child, parent) -> Future:
+        """Load fresh column choices for both sides of a relationship on one worker."""
+        return self._pool.submit('relationship_endpoints', child, parent)
 
     def save_custom_relationship(self, identifier, key: Relationship) -> Future:
         return self._pool.submit('save_custom_relationship', identifier, key)
@@ -495,6 +424,42 @@ class NavigationSession:
                         for record in self.store.relationships(self.model, dialect=self.dialect))
         return merge_relationships(details, declarations, dialect=self.dialect)
 
+    def navigation_links(self, table, generation):
+        ref = self.metadata.resolve_table(self, table, generation)
+        details = self.metadata.details(self, ref, generation)
+        return navigation_links(details, show_schema=self.dialect.supports_schemas)
+
+    def primary_key(self, table, schema, generation):
+        ref = TableRef(schema, table) if schema else self.metadata.resolve_table(self, table, generation)
+        return self.metadata.table(self, ref, generation).primary_key
+
+    def relationship_diagram(self, table, generation):
+        """Build the one-hop diagram, reading only table metadata for its endpoints."""
+        ref = self.metadata.resolve_table(self, table, generation)
+        details = self.metadata.details(self, ref, generation)
+        links = navigation_links(details, show_schema=self.dialect.supports_schemas)
+        master = _table_key(self.dialect, ref.schema, ref.name)
+        endpoints = {master: ref}
+        participants = {master: []}
+        for link in links:
+            key = _table_key(self.dialect, link.schema, link.table)
+            endpoints.setdefault(key, link.ref)
+            participants.setdefault(key, []).extend(link.columns)
+            participants[master].extend(link.selected_columns)
+
+        columns = {}
+        for key, endpoint in endpoints.items():
+            snapshot = details.table if key == master else self.metadata.table(self, endpoint, generation)
+            seen, selected = set(), []
+            for names, is_primary in ((snapshot.primary_key, True), (participants[key], False)):
+                for name in names:
+                    identity = self.dialect.identifier_key(name)
+                    if identity not in seen:
+                        selected.append((name, is_primary))
+                        seen.add(identity)
+            columns[key] = tuple(selected)
+        return (ref.schema, ref.name), links, columns
+
     def query(self, sql, limit, parameters=()):
         args = (sql, limit, parameters) if parameters else (sql, limit)
         return self.database_backend.query(*args)
@@ -517,13 +482,12 @@ class NavigationSession:
             if self._store is not None:
                 self._store.close()
 
-    def _key(self, link, generation):
+    def _destination(self, link, generation):
         table = self.dialect.table_reference(link.table, link.schema)
-        ref = self.metadata.resolve_table(self.database_backend, table, generation)
-        return self.model, ref.schema, ref.name
+        return self.metadata.resolve_table(self.database_backend, table, generation)
 
-    def _columns(self, key, generation):
-        table = self.metadata.table(self.database_backend, TableRef(*key[1:]), generation)
+    def _columns(self, ref, generation):
+        table = self.metadata.table(self.database_backend, ref, generation)
         return tuple(column.name for column in table.columns)
 
     def startup_sql(self):
@@ -544,6 +508,9 @@ class NavigationSession:
         self.dialect.validate_identifier(ref.name)
         table = self.table(ref)
         return ref.schema, ref.name, tuple(column.name for column in table.columns)
+
+    def relationship_endpoints(self, child, parent):
+        return self.relationship_columns(*child), self.relationship_columns(*parent)
 
     def save_custom_relationship(self, identifier, key: Relationship):
         validate_relationship(key, dialect=self.dialect)
@@ -576,23 +543,23 @@ class NavigationSession:
     def table_preferences(self, link):
         # Keep stale or invalid choices editable without validating against metadata.
         generation = self.metadata.generation
-        key = self._key(link, generation)
+        ref = self._destination(link, generation)
         saved = {}
         try:
-            selected = self.store.columns(self.model, TableRef(*key[1:]))
+            selected = self.store.selected_columns(self.model, ref)
             if selected:
-                saved['columns'] = tuple(column.column_name for column in selected)
+                saved['columns'] = selected
         except ValueError as exc:
             saved['columns'] = ()
             saved['columns_error'] = str(exc)
         try:
-            order = self.store.order(self.model, TableRef(*key[1:]))
+            order = self.store.sort_order(self.model, ref)
             if order:
-                saved['order_by'] = tuple((row.column_name, row.direction) for row in order)
+                saved['order_by'] = order
         except ValueError as exc:
             saved['order_by'] = ()
             saved['order_by_error'] = str(exc)
-        return self._columns(key, generation), saved
+        return self._columns(ref, generation), saved
 
     def navigation_defaults(self, table):
         ref = self.database_backend.resolve(table)
@@ -633,38 +600,31 @@ class NavigationSession:
         if property_name not in ('columns', 'order_by'):
             raise ValueError('Unsupported table preference.')
         generation = self.metadata.generation
-        key = self._key(link, generation)
+        ref = self._destination(link, generation)
         if choices is None:
-            if property_name == 'columns':
-                self.store.replace_columns(self.model, TableRef(*key[1:]), ())
-            else:
-                self.store.replace_order(self.model, TableRef(*key[1:]), ())
-            return
-        if not choices:
-            raise ValueError('Choose at least one column.')
-        selected, order = (tuple(choices), ()) if property_name == 'columns' else ((), tuple(choices))
-        self._validate(self._columns(key, generation), selected, order)
-        if property_name == 'columns':
-            self.store.replace_columns(self.model, TableRef(*key[1:]),
-                                       tuple(StoredColumn(*key, name, position) for position, name in enumerate(selected)))
+            choices = ()
         else:
-            self.store.replace_order(self.model, TableRef(*key[1:]),
-                                     tuple(StoredOrder(*key, name, direction, position)
-                                           for position, (name, direction) in enumerate(order)))
+            if isinstance(choices, str):
+                raise ValueError('Supply column choices as a sequence.')
+            choices = tuple(choices)
+            if not choices:
+                raise ValueError('Choose at least one column.')
+            selected, order = (choices, ()) if property_name == 'columns' else ((), choices)
+            self._validate(self._columns(ref, generation), selected, order)
+        if property_name == 'columns':
+            self.store.set_selected_columns(self.model, ref, choices)
+        else:
+            self.store.set_sort_order(self.model, ref, choices)
 
     def _options(self, link):
         generation = self.metadata.generation
-        key = self._key(link, generation)
-        return self._table_options(TableRef(*key[1:]), generation)
+        return self._table_options(self._destination(link, generation), generation)
 
     def _table_options(self, ref, generation):
-        key = self.model, ref.schema, ref.name
-        columns = self.store.columns(self.model, TableRef(*key[1:]))
-        order = self.store.order(self.model, TableRef(*key[1:]))
+        columns = self.store.selected_columns(self.model, ref)
+        order = self.store.sort_order(self.model, ref)
         if columns or order:
-            self._validate(self._columns(key, generation),
-                           tuple(record.column_name for record in columns),
-                           tuple((record.column_name, record.direction) for record in order))
+            self._validate(self._columns(ref, generation), columns, order)
         return columns, order
 
     def table_query(self, ref, limit):

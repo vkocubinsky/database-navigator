@@ -22,7 +22,7 @@ from typing import Literal
 
 from .contracts import TableNotFoundError
 from .metadata_models import Column, Relationship, Table, TableDetails, TableRef, TableSummary
-from .navigation import (derived_reference, parse_table, primary_key_values, validate_limit)
+from .query import base_table_for_query, parse_table, primary_key_values, validate_limit
 
 
 # PostgreSQL 18 keywords that cannot be ordinary table/column names (ColId):
@@ -83,6 +83,10 @@ class PostgreSQLDialect:
 
     def table_reference(self, table, schema=None):
         return qualified_table(table, schema or None)
+
+    def reference_from_sql(self, token):
+        schema, table = self.split_reference(token)
+        return self.table_reference(table, schema)
 
     def split_reference(self, reference):
         return parse_table(reference, postgres=True)
@@ -337,8 +341,7 @@ class PostgreSQLBackend:
             self._connection = None
 
     def base_table(self, query):
-        schema, table = derived_reference(query, postgres=True)
-        return qualified_table(table, schema)
+        return base_table_for_query(query, self.dialect)
 
     def list_tables(self) -> tuple[TableSummary, ...]:
         from psycopg.rows import tuple_row
