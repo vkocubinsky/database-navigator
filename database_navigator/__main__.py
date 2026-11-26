@@ -16,13 +16,12 @@
 
 """Temporary JSON command-line interface for inspecting backend results."""
 
-import argparse
 import json
 from pathlib import Path
 import sqlite3
 import sys
 
-from . import __version__
+from .connection import connection_parser, select_backend
 from .db_postgres import postgres_foreign_keys, connect_read_only, read_operation, PostgreSQLError
 from .db_sqlite import sqlite_foreign_keys
 from .contracts import TableNotFoundError
@@ -31,8 +30,8 @@ from .contracts import TableNotFoundError
 __all__ = ["main"]
 
 
-def inspect(connection_string: str, table: str, schema: str | None = None):
-    if connection_string.startswith("sqlite:///"):
+def inspect(connection_string: str, table: str, schema: str | None = None, *, backend=None):
+    if select_backend(connection_string, backend) == "sqlite":
         path = connection_string[len("sqlite:///"):]
         if not path:
             raise ValueError("SQLite connection string must contain a path")
@@ -42,8 +41,6 @@ def inspect(connection_string: str, table: str, schema: str | None = None):
             return sqlite_foreign_keys(connection, table, schema or "main")
         finally:
             connection.close()
-    if connection_string.startswith("sqlite:"):
-        raise ValueError("Use sqlite:///path/to/database for SQLite")
     connection = connect_read_only(connection_string)
     try:
         with read_operation(connection):
@@ -53,14 +50,12 @@ def inspect(connection_string: str, table: str, schema: str | None = None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="List foreign keys that link this table to its parents (JSON)")
-    parser.add_argument('--version', action='version', version=f'Database Navigator {__version__}')
-    parser.add_argument("connection", help="SQLite URL or PostgreSQL libpq connection string")
+    parser = connection_parser("List foreign keys that link this table to its parents (JSON)")
     parser.add_argument("table", help="Literal table name; use --schema for the schema")
     parser.add_argument("--schema")
-    args = parser.parse_args()
+    args = parser.parse_intermixed_args()
     try:
-        keys = inspect(args.connection, args.table, args.schema)
+        keys = inspect(args.connection, args.table, args.schema, backend=args.backend)
     except (ValueError, TableNotFoundError, sqlite3.Error, PostgreSQLError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

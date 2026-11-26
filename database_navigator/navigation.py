@@ -22,6 +22,7 @@ from concurrent.futures import Future
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
+from .connection import select_backend
 from .metadata_models import Relationship, Table, TableDetails, TableRef, TableSummary
 from .metadata_cache import MetadataCache
 from .query import (Query, base_table_for_query, column_values, derived_reference,
@@ -345,18 +346,19 @@ class Navigation:
         return self._pool.submit('delete_custom_relationship', identifier)
 
 
-def create_backend(connection_string) -> DatabaseBackend:
+def create_backend(connection_string, *, backend=None) -> DatabaseBackend:
     """Select a read-only database backend without opening a connection."""
     from .db_sqlite import SQLiteBackend
     from .db_postgres import PostgreSQLBackend
 
-    backend_type = SQLiteBackend if connection_string.startswith("sqlite:") else PostgreSQLBackend
+    name = select_backend(connection_string, backend)
+    backend_type = {"sqlite": SQLiteBackend, "postgresql": PostgreSQLBackend}[name]
     return backend_type(connection_string)
 
 
-def open_navigation(connection, *, model=None, application_database=DEFAULT_DATABASE):
+def open_navigation(connection, *, backend=None, model=None, application_database=DEFAULT_DATABASE):
     """Validate configuration before starting any workers or opening the window."""
-    return Navigation(create_backend(connection), model=model,
+    return Navigation(create_backend(connection, backend=backend), model=model,
                       application_database=application_database)
 
 

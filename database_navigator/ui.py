@@ -16,12 +16,12 @@
 
 """Tkinter query results and navigation through directly related tables."""
 
-import argparse
 import tkinter as tk
 import time
 from tkinter import ttk
 
 from . import __version__
+from .connection import connection_parser
 from .ui_table import DataTable
 from .ui_state import BrowsingState
 from .controller import NavigationController
@@ -1053,17 +1053,15 @@ class Navigator(ttk.Frame):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Read-only SQLite/PostgreSQL Database Navigator")
-    parser.add_argument('--version', action='version', version=f'Database Navigator {__version__}')
-    parser.add_argument("connection")
+    parser = connection_parser("Read-only SQLite/PostgreSQL Database Navigator")
     parser.add_argument('--model', default='default',
                         help='Shared database model used for preferences and relationships (default: default)')
     parser.add_argument('--application-database', default=DEFAULT_DATABASE,
                         help='Local SQLite preferences file (default: database-navigator.sqlite)')
     args = parser.parse_args()
     try:
-        navigation = open_navigation(args.connection, model=args.model,
-                               application_database=args.application_database)
+        navigation = open_navigation(args.connection, backend=args.backend, model=args.model,
+                                     application_database=args.application_database)
     except ValueError as exc:
         parser.exit(1, f"Error: {exc}\n")
     try:

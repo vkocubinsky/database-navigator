@@ -68,10 +68,12 @@ There is no need to activate the environment: both launchers use `.venv` directl
 
 ## Launch
 
-Pass a connection string and optionally a model name:
+Choose `sqlite` or `postgresql` with `--backend`. Pass the connection string
+as one argument to `--connection`. Existing commands with a positional
+connection string still work, and omitting `--backend` enables automatic selection.
 
 ```sh
-./launch.sh --model example 'CONNECTION STRING'
+./launch.sh --backend sqlite --connection 'sqlite:///example.sqlite' --model example
 ```
 
 The model is a name you choose for a database structure. It enables saved
@@ -85,13 +87,13 @@ settings; choose distinct model names for unrelated databases. Custom relationsh
 Open an existing file using an absolute path (four slashes before the path):
 
 ```sh
-./launch.sh --model example 'sqlite:////absolute/path/example.sqlite'
+./launch.sh --backend sqlite --connection 'sqlite:////absolute/path/example.sqlite' --model example
 ```
 
 Or use a path relative to the cloned project directory:
 
 ```sh
-./launch.sh --model example 'sqlite:///data/example.sqlite'
+./launch.sh --backend sqlite --connection 'sqlite:///data/example.sqlite' --model example
 ```
 
 The file must already exist. It is opened read-only; the application does not
@@ -102,20 +104,20 @@ create the database you want to browse.
 Use a libpq connection string with your own host, database, and user:
 
 ```sh
-./launch.sh --model example 'host=localhost port=5432 dbname=example user=reader'
+./launch.sh --backend postgresql --connection 'host=localhost port=5432 dbname=example user=reader' --model example
 ```
 
 PostgreSQL connection URLs also work:
 
 ```sh
-./launch.sh --model example 'postgresql://reader@localhost:5432/example'
+./launch.sh --backend postgresql --connection 'postgresql://reader@localhost:5432/example' --model example
 ```
 
 On Windows, use double quotes around connection strings:
 
 ```bat
-launch.bat --model example "host=localhost port=5432 dbname=example user=reader"
-launch.bat --model example "postgresql://reader@localhost:5432/example"
+launch.bat --backend postgresql --connection "host=localhost port=5432 dbname=example user=reader" --model example
+launch.bat --backend postgresql --connection "postgresql://reader@localhost:5432/example" --model example
 ```
 
 Use normal libpq credential mechanisms such as `.pgpass` instead of embedding
@@ -128,20 +130,29 @@ Use forward slashes in the SQLite connection string, with three slashes before
 an absolute Windows drive path:
 
 ```bat
-launch.bat --model example "sqlite:///C:/Data/example.sqlite"
-launch.bat --model example "sqlite:///data/example.sqlite"
+launch.bat --backend sqlite --connection "sqlite:///C:/Data/example.sqlite" --model example
+launch.bat --backend sqlite --connection "sqlite:///data/example.sqlite" --model example
 launch.bat --help
 ```
 
 The second example is relative to the cloned project directory. As on macOS/Linux,
 the database file must already exist.
 
+### Metadata CLI
+
+To print a table’s foreign keys as JSON, use the same connection options and
+give the table name as a positional argument.
+
+```sh
+.venv/bin/python -m database_navigator --backend sqlite --connection 'sqlite:///example.sqlite' orders
+```
+
 ### Options and file locations
 
 ```sh
 ./launch.sh --help
-./launch.sh --model example --application-database /absolute/path/preferences.sqlite \
-  'sqlite:////absolute/path/example.sqlite'
+./launch.sh --backend sqlite --connection 'sqlite:////absolute/path/example.sqlite' \
+  --model example --application-database /absolute/path/preferences.sqlite
 ```
 
 The launcher forwards all arguments to the app and runs from the cloned project

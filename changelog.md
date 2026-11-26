@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.0
+
+- The UI and JSON metadata CLI now accept `--backend sqlite` or
+  `--backend postgresql` with `--connection STRING`. For PostgreSQL, a launcher
+  can use `--backend postgresql --connection "host=localhost dbname=example"`.
+  Existing positional connection strings still work. Both commands reject
+  unsupported URL schemes and URLs that conflict with the selected backend
+  before opening a connection.
+
 ## 0.7.0
 
 - **Open table** and **Open row** cancel a pending open if you change the row
